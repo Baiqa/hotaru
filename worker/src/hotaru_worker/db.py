@@ -1,0 +1,580 @@
+import logging
+from contextlib import contextmanager
+from datetime import timedelta
+
+import psycopg
+from pgvector.psycopg import register_vector
+from psycopg import errors as pg_errors
+from psycopg.rows import dict_row
+
+logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def connect(database_url: str):
+    conn = psycopg.connect(database_url, autocommit=True, row_factory=dict_row)
+    register_vector(conn)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def seed_sources(conn, sources: list[dict]) -> dict[str, str]:
+    """Идемпотентно синхронизирует worker/sources.yaml с таблицей sources.
+
+    sources.yaml — источник правды по списку изданий (не миграция),
+    т.к. список публикаций меняется независимо от схемы БД.
+    """
+    ids: dict[str, str] = {}
+    with conn.cursor() as cur:
+        for src in sources:
+            cur.execute(
+                """
+                insert into sources (name, base_url, fetch_method, rss_url, lang)
+                values (%(name)s, %(base_url)s, %(fetch_method)s, %(rss_url)s, %(lang)s)
+                on conflict (base_url) do update set
+                    name = excluded.name,
+                    fetch_method = excluded.fetch_method,
+                    rss_url = excluded.rss_url,
+                    lang = excluded.lang
+                returning id
+                """,
+                src,
+            )
+            ids[src["base_url"]] = cur.fetchone()["id"]
+    return ids
+
+
+def existing_canonical_urls(conn, urls: list[str]) -> set[str]:
+    """Какие из этих canonical_url уже есть в БД — чтобы не скачивать их заново
+    каждый прогон крона (раз в 30 минут по одному и тому же списку статей)."""
+    if not urls:
+        return set()
+    with conn.cursor() as cur:
+        cur.execute("select canonical_url from articles where canonical_url = any(%s)", (urls,))
+        return {row["canonical_url"] for row in cur.fetchall()}
+
+
+def mark_robots_checked(conn, source_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "update sources set robots_checked_at = now() where id = %s",
+            (source_id,),
+        )
+
+
+def seed_aliases(conn, aliases: list[dict]) -> None:
+    """Идемпотентно подгружает aliases_seed.yaml — по образцу seed_sources().
+
+    Каждая запись: canonical_name, type, aliases: [{alias, lang}, ...].
+    """
+    with conn.cursor() as cur:
+        for entry in aliases:
+            cur.execute(
+                """
+                insert into entities (canonical_name, type)
+                values (%(canonical_name)s, %(type)s)
+                on conflict (canonical_name, type) do update set canonical_name = excluded.canonical_name
+                returning id
+                """,
+                entry,
+            )
+            entity_id = cur.fetchone()["id"]
+            for alias in entry["aliases"]:
+                cur.execute(
+                    """
+                    insert into entity_aliases (entity_id, alias, lang)
+                    values (%(entity_id)s, %(alias)s, %(lang)s)
+                    on conflict (lower(alias), lang) do nothing
+                    """,
+                    {"entity_id": entity_id, **alias},
+                )
+
+
+def find_entity_by_alias(conn, alias: str, lang: str) -> str | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "select entity_id from entity_aliases where lower(alias) = lower(%s) and lang = %s",
+            (alias, lang),
+        )
+        row = cur.fetchone()
+        return row["entity_id"] if row else None
+
+
+def list_aliases(conn, lang: str, entity_type: str) -> list[dict]:
+    """Кандидаты для нечёткого сопоставления (rapidfuzz) — алиасы того же языка
+    и типа сущности, чтобы 'Токаев' (person) не подтягивал 'org'-алиасы."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select ea.alias, ea.entity_id
+            from entity_aliases ea
+            join entities e on e.id = ea.entity_id
+            where ea.lang = %s and e.type = %s
+            """,
+            (lang, entity_type),
+        )
+        return cur.fetchall()
+
+
+def create_entity(conn, canonical_name: str, entity_type: str) -> str:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into entities (canonical_name, type)
+            values (%s, %s)
+            on conflict (canonical_name, type) do update set canonical_name = excluded.canonical_name
+            returning id
+            """,
+            (canonical_name, entity_type),
+        )
+        return cur.fetchone()["id"]
+
+
+def shorten_canonical_name_if_needed(conn, entity_id: str, candidate_name: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            update entities
+            set canonical_name = %(candidate_name)s
+            where id = %(entity_id)s and length(%(candidate_name)s) < length(canonical_name)
+            """,
+            {"entity_id": entity_id, "candidate_name": candidate_name},
+        )
+
+
+def add_alias(conn, entity_id: str, alias: str, lang: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into entity_aliases (entity_id, alias, lang)
+            values (%s, %s, %s)
+            on conflict (lower(alias), lang) do nothing
+            """,
+            (entity_id, alias, lang),
+        )
+
+
+def upsert_article_entity(conn, article_id: str, entity_id: str, mention_count: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into article_entities (article_id, entity_id, mention_count)
+            values (%s, %s, %s)
+            on conflict (article_id, entity_id) do update set mention_count = excluded.mention_count
+            """,
+            (article_id, entity_id, mention_count),
+        )
+
+
+def articles_missing_entities(conn, limit: int) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select a.id, a.title, a.lead, a.body, s.lang
+            from articles a
+            join sources s on s.id = a.source_id
+            where a.entities_extracted_at is null
+            order by a.published_at nulls last
+            limit %s
+            """,
+            (limit,),
+        )
+        return cur.fetchall()
+
+
+def mark_entities_extracted(conn, article_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "update articles set entities_extracted_at = now() where id = %s",
+            (article_id,),
+        )
+
+
+def articles_missing_embedding(conn, limit: int) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select id, title, lead
+            from articles
+            where embedding is null
+            order by published_at nulls last
+            limit %s
+            """,
+            (limit,),
+        )
+        return cur.fetchall()
+
+
+def update_embedding(conn, article_id: str, vector: list[float]) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "update articles set embedding = %s where id = %s",
+            (vector, article_id),
+        )
+
+
+def get_article(conn, article_id: str) -> dict | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "select id, title, lead, body, published_at, embedding from articles where id = %s",
+            (article_id,),
+        )
+        return cur.fetchone()
+
+
+def entity_ids_by_article(conn, article_ids: list[str]) -> dict[str, set[str]]:
+    """Множества entity_id для нескольких статей за один запрос (вместо N+1)."""
+    result: dict[str, set[str]] = {aid: set() for aid in article_ids}
+    if not article_ids:
+        return result
+    with conn.cursor() as cur:
+        cur.execute(
+            "select article_id, entity_id from article_entities where article_id = any(%s)",
+            (article_ids,),
+        )
+        for row in cur.fetchall():
+            result[row["article_id"]].add(row["entity_id"])
+    return result
+
+
+def find_candidate_articles(
+    conn,
+    article_id: str,
+    embedding,
+    entity_ids: list[str],
+    window_days: int | None,
+    published_at,
+    limit: int,
+) -> list[dict]:
+    """Раздел 3.3 CLAUDE.md: кандидаты — статьи, делящие хотя бы одну сущность,
+    в пределах окна по времени, топ-N по косинусной близости pgvector. DISTINCT
+    через EXISTS (не JOIN), чтобы статья, делящая несколько сущностей с целевой,
+    не размножалась на несколько строк.
+    """
+    params: dict = {
+        "article_id": article_id,
+        "embedding": embedding,
+        "entity_ids": entity_ids,
+        "limit": limit,
+    }
+    time_filter = ""
+    if window_days is not None and published_at is not None:
+        time_filter = "and a.published_at between %(from)s and %(to)s"
+        params["from"] = published_at - timedelta(days=window_days)
+        params["to"] = published_at + timedelta(days=window_days)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            select a.id, a.title, a.lead, a.body, a.published_at,
+                   1 - (a.embedding <=> %(embedding)s) as cosine_sim
+            from articles a
+            where a.id != %(article_id)s
+              and a.embedding is not null
+              and exists (
+                select 1 from article_entities ae
+                where ae.article_id = a.id and ae.entity_id = any(%(entity_ids)s)
+              )
+              {time_filter}
+            order by a.embedding <=> %(embedding)s
+            limit %(limit)s
+            """,
+            params,
+        )
+        return cur.fetchall()
+
+
+def list_active_events(conn) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select e.id, e.title, e.centroid, e.started_at,
+                   (select count(*) from event_articles ea where ea.event_id = e.id) as article_count
+            from events e
+            where e.status = 'active' and e.centroid is not null
+            """
+        )
+        return cur.fetchall()
+
+
+def event_entity_ids(conn, event_id: str) -> list[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select distinct ae.entity_id
+            from event_articles ea
+            join article_entities ae on ae.article_id = ea.article_id
+            where ea.event_id = %s
+            """,
+            (event_id,),
+        )
+        return [row["entity_id"] for row in cur.fetchall()]
+
+
+def event_majority_entities(conn, event_id: str) -> set[str]:
+    """Сущности, встречающиеся в >=половине статей события — сигнал, которого не хватает
+    чистому косинусу центроидов в event_merge.py (см. tmp/plans/etap1-kalibrovka-po-keisam.md,
+    находка 1): две "одножанровые", но реально разных события подборки статей могут иметь
+    близкий косинус, но не делят ни одной сущности, присутствующей в большинстве статей."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select ae.entity_id
+            from event_articles ea
+            join article_entities ae on ae.article_id = ea.article_id
+            where ea.event_id = %(event_id)s
+            group by ae.entity_id
+            having count(distinct ea.article_id) * 2 >= (
+                select count(*) from event_articles where event_id = %(event_id)s
+            )
+            """,
+            {"event_id": event_id},
+        )
+        return {row["entity_id"] for row in cur.fetchall()}
+
+
+def find_similar_events(
+    conn,
+    event_id: str,
+    centroid,
+    entity_ids: list[str],
+    window_days: int,
+    started_at,
+    limit: int,
+) -> list[dict]:
+    """По образцу find_candidate_articles, но на уровне событий: общая сущность
+    (через их статьи), окно по started_at, топ-N по косинусу центроидов."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select e.id, e.started_at,
+                   (select count(*) from event_articles ea2 where ea2.event_id = e.id) as article_count,
+                   1 - (e.centroid <=> %(centroid)s) as cosine_sim
+            from events e
+            where e.id != %(event_id)s
+              and e.status = 'active'
+              and e.centroid is not null
+              and e.started_at between %(from)s and %(to)s
+              and exists (
+                select 1 from event_articles ea
+                join article_entities ae on ae.article_id = ea.article_id
+                where ea.event_id = e.id and ae.entity_id = any(%(entity_ids)s)
+              )
+            order by e.centroid <=> %(centroid)s
+            limit %(limit)s
+            """,
+            {
+                "event_id": event_id,
+                "centroid": centroid,
+                "entity_ids": entity_ids,
+                "from": started_at - timedelta(days=window_days),
+                "to": started_at + timedelta(days=window_days),
+                "limit": limit,
+            },
+        )
+        return cur.fetchall()
+
+
+def merge_events(conn, canonical_id: str, absorbed_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "update event_articles set event_id = %s where event_id = %s",
+            (canonical_id, absorbed_id),
+        )
+        cur.execute(
+            "update events set canonical_id = %s, status = 'merged' where id = %s",
+            (canonical_id, absorbed_id),
+        )
+        cur.execute(
+            """
+            update events set started_at = least(started_at, (select started_at from events where id = %s))
+            where id = %s
+            """,
+            (absorbed_id, canonical_id),
+        )
+
+
+def event_member_embeddings(conn, event_id: str) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select a.id as article_id, a.embedding, a.published_at, a.title
+            from articles a
+            join event_articles ea on ea.article_id = a.id
+            where ea.event_id = %s
+            """,
+            (event_id,),
+        )
+        return cur.fetchall()
+
+
+def create_event_from_articles(conn, title: str, started_at, article_ids: list[str]) -> str:
+    with conn.cursor() as cur:
+        cur.execute(
+            "insert into events (title, started_at) values (%s, %s) returning id",
+            (title, started_at),
+        )
+        new_event_id = cur.fetchone()["id"]
+        cur.execute(
+            "update event_articles set event_id = %s where article_id = any(%s)",
+            (new_event_id, article_ids),
+        )
+    return new_event_id
+
+
+def articles_missing_event(conn, limit: int) -> list[dict]:
+    """Раздел 3.3 CLAUDE.md — алгоритм инкрементальный, порядок обработки важен
+    (кандидат должен успеть получить событие до того, как его сравнят со следующей
+    статьёй), поэтому строго по published_at, не просто "необработанные"."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select a.id, a.title, a.lead, a.published_at, a.embedding
+            from articles a
+            where a.embedding is not null
+              and a.entities_extracted_at is not null
+              and not exists (select 1 from event_articles ea where ea.article_id = a.id)
+            order by a.published_at nulls last
+            limit %s
+            """,
+            (limit,),
+        )
+        return cur.fetchall()
+
+
+def event_id_for_article(conn, article_id: str) -> str | None:
+    with conn.cursor() as cur:
+        cur.execute("select event_id from event_articles where article_id = %s", (article_id,))
+        row = cur.fetchone()
+        return row["event_id"] if row else None
+
+
+def create_event(conn, article: dict) -> str:
+    """Заводит новое событие со статьёй-основателем. title/started_at/centroid
+    берутся из неё; полноценный синтез title — Этап 2, тут временная заглушка."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into events (title, started_at, centroid)
+            values (%(title)s, coalesce(%(published_at)s, now()), %(embedding)s)
+            returning id
+            """,
+            article,
+        )
+        event_id = cur.fetchone()["id"]
+        cur.execute(
+            """
+            insert into event_articles (article_id, event_id, similarity_score)
+            values (%s, %s, null)
+            """,
+            (article["id"], event_id),
+        )
+    return event_id
+
+
+def join_event(conn, event_id: str, article_id: str, similarity_score: float) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into event_articles (article_id, event_id, similarity_score)
+            values (%s, %s, %s)
+            """,
+            (article_id, event_id, similarity_score),
+        )
+
+
+def recompute_event_centroid(conn, event_id: str) -> None:
+    """Полный пересчёт (не инкрементальный) — при текущих объёмах дёшево, а раздел
+    3.3 явно требует НЕ использовать centroid для решений о совпадении (только для
+    показа/будущего merge), так что цена малой неточности здесь низкая."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "select a.embedding from articles a join event_articles ea on ea.article_id = a.id where ea.event_id = %s",
+            (event_id,),
+        )
+        vectors = [row["embedding"].to_list() for row in cur.fetchall()]
+        if not vectors:
+            return
+        centroid = [sum(coords) / len(vectors) for coords in zip(*vectors)]
+        cur.execute("update events set centroid = %s where id = %s", (centroid, event_id))
+
+
+def get_gray_zone_verdict(conn, article_a_id: str, article_b_id: str) -> str | None:
+    a, b = sorted((article_a_id, article_b_id))
+    with conn.cursor() as cur:
+        cur.execute(
+            "select verdict from gray_zone_verdicts where article_a_id = %s and article_b_id = %s",
+            (a, b),
+        )
+        row = cur.fetchone()
+        return row["verdict"] if row else None
+
+
+def save_gray_zone_verdict(conn, article_a_id: str, article_b_id: str, verdict: str) -> None:
+    a, b = sorted((article_a_id, article_b_id))
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into gray_zone_verdicts (article_a_id, article_b_id, verdict)
+            values (%s, %s, %s)
+            on conflict (article_a_id, article_b_id) do nothing
+            """,
+            (a, b, verdict),
+        )
+
+
+def articles_for_events(conn, event_ids: list[str]) -> list[dict]:
+    """Полные данные статей для набора событий — для экспорта в инструмент
+    разметки B-Cubed (worker/eval/sample.py)."""
+    if not event_ids:
+        return []
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select a.id as article_id, a.title, a.lead, a.published_at,
+                   ea.event_id, s.name as source_name
+            from event_articles ea
+            join articles a on a.id = ea.article_id
+            join sources s on s.id = a.source_id
+            where ea.event_id = any(%s)
+            """,
+            (event_ids,),
+        )
+        return cur.fetchall()
+
+
+def event_ids_for_articles(conn, article_ids: list[str]) -> dict[str, str]:
+    """article_id -> текущий event_id — для сверки с ручной разметкой
+    (worker/eval/bcubed.py). Читает live-состояние, а не экспортированный
+    снимок, т.к. merge/split могли отработать между разметкой и подсчётом."""
+    if not article_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "select article_id, event_id from event_articles where article_id = any(%s)",
+            (article_ids,),
+        )
+        return {str(row["article_id"]): str(row["event_id"]) for row in cur.fetchall()}
+
+
+def insert_article(conn, article: dict) -> str:
+    """Вставляет статью. Дедуп по canonical_url/content_hash обеспечивают
+    unique-constraint'ы миграции — при конфликте просто считаем дублем."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into articles
+                    (source_id, url, canonical_url, title, lead, body, published_at,
+                     content_hash, fetch_status)
+                values
+                    (%(source_id)s, %(url)s, %(canonical_url)s, %(title)s, %(lead)s, %(body)s,
+                     %(published_at)s, %(content_hash)s, %(fetch_status)s)
+                """,
+                article,
+            )
+        return "inserted"
+    except pg_errors.UniqueViolation:
+        return "duplicate"

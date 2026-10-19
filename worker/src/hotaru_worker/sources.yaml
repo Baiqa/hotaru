@@ -1,0 +1,69 @@
+# Стартовый список источников для Этапа 0.
+# Каждый rss_url проверен вручную (feedparser реально получает статьи) при
+# добавлении в этот файл — не гадать новые URL без проверки.
+#
+# Источника на казахском языке (lang: kk) здесь пока нет: у tengrinews.kz и
+# forbes.kz не нашлось рабочего публичного RSS (autodiscovery ничего не дал,
+# гадать путь фида не стали) — эта дырка в разделе 8 CLAUDE.md ("языковое
+# распределение источников") ещё открыта.
+
+sources:
+  - name: "BBC News (World)"
+    base_url: "https://www.bbc.com/news/world"
+    rss_url: "https://feeds.bbci.co.uk/news/world/rss.xml"
+    fetch_method: "rss"
+    lang: "en"
+
+  - name: "The Guardian (World)"
+    base_url: "https://www.theguardian.com/world"
+    rss_url: "https://www.theguardian.com/world/rss"
+    fetch_method: "rss"
+    lang: "en"
+
+  - name: "NPR News"
+    base_url: "https://www.npr.org/sections/news/"
+    rss_url: "https://feeds.npr.org/1001/rss.xml"
+    fetch_method: "rss"
+    lang: "en"
+
+  - name: "TechCrunch"
+    base_url: "https://techcrunch.com"
+    rss_url: "https://techcrunch.com/feed/"
+    fetch_method: "rss"
+    lang: "en"
+
+  - name: "Al Jazeera (English)"
+    base_url: "https://www.aljazeera.com"
+    rss_url: "https://www.aljazeera.com/xml/rss/all.xml"
+    fetch_method: "rss"
+    lang: "en"
+
+  - name: "Habr"
+    base_url: "https://habr.com"
+    rss_url: "https://habr.com/ru/rss/all/all/"
+    fetch_method: "rss"
+    lang: "ru"
+
+  - name: "DW на русском"
+    base_url: "https://www.dw.com/ru"
+    rss_url: "https://rss.dw.com/rdf/rss-ru-news"
+    fetch_method: "rss"
+    lang: "ru"
+
+  - name: "РИА Новости"
+    base_url: "https://ria.ru"
+    rss_url: "https://ria.ru/export/rss2/archive/index.xml"
+    fetch_method: "rss"
+    lang: "ru"
+
+  - name: "ТАСС"
+    base_url: "https://tass.ru"
+    rss_url: "https://tass.ru/rss/v2.xml"
+    fetch_method: "rss"
+    lang: "ru"
+
+  - name: "Интерфакс"
+    base_url: "https://www.interfax.ru"
+    rss_url: "https://www.interfax.ru/rss.asp"
+    fetch_method: "rss"
+    lang: "ru"

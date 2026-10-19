@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<title>Hotaru — разметка событий для B-Cubed</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: system-ui, sans-serif; margin: 0; background: #f4f5f7; color: #1a1a1a; }
+  header { position: sticky; top: 0; background: #1a1a1a; color: #fff; padding: 10px 16px;
+           display: flex; gap: 20px; align-items: center; font-size: 14px; z-index: 10; }
+  header b { font-size: 15px; }
+  #status { margin-left: auto; opacity: 0.8; }
+  main { padding: 16px; display: flex; flex-direction: column; gap: 12px; max-width: 1100px; margin: 0 auto; }
+  .group { background: #fff; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; }
+  .group.known-large { border-color: #d9822b; box-shadow: 0 0 0 1px #d9822b inset; }
+  .group-header { display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+                   background: #eef0f3; border-bottom: 1px solid #ddd; flex-wrap: wrap; }
+  .group-header .badge { color: #b4590f; font-size: 12px; font-weight: 600; }
+  .group-header .meta { font-size: 13px; color: #444; }
+  .group-header .spacer { flex: 1; }
+  .group-header select, .group-header button { font-size: 12px; padding: 3px 6px; }
+  .article { display: flex; gap: 10px; padding: 8px 12px; border-bottom: 1px solid #f0f0f0; align-items: flex-start; }
+  .article:last-child { border-bottom: none; }
+  .article-body { flex: 1; min-width: 0; }
+  .article-title { font-weight: 600; font-size: 14px; }
+  .article-meta { font-size: 12px; color: #777; margin-top: 2px; }
+  .article-lead { font-size: 13px; color: #333; margin-top: 4px; }
+  .article-move select { font-size: 12px; }
+  #empty { text-align: center; color: #777; padding: 40px; }
+</style>
+</head>
+<body>
+<header>
+  <b>Разметка событий</b>
+  <span id="progress"></span>
+  <span id="status"></span>
+</header>
+<main id="main">
+  <div id="empty">Загрузка…</div>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

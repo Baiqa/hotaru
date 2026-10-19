@@ -1,0 +1,38 @@
+# Небольшой стартовый набор алиасов для наглядных/частых сущностей текущего потока
+# (источники — sources.yaml, только ru/en). Не исчерпывающий справочник: остальные
+# сущности resolve_entity() создаёт автоматически по ходу извлечения (entities.py).
+# Пример "Нацбанк / НБ РК / Национальный банк Казахстана" — прямая иллюстрация
+# раздела 3.3 CLAUDE.md.
+
+entities:
+  - canonical_name: "Национальный Банк Казахстана"
+    type: "org"
+    aliases:
+      - {alias: "Нацбанк", lang: "ru"}
+      - {alias: "НБ РК", lang: "ru"}
+      - {alias: "Национальный Банк Казахстана", lang: "ru"}
+      - {alias: "National Bank of Kazakhstan", lang: "en"}
+
+  - canonical_name: "Казахстан"
+    type: "place"
+    aliases:
+      - {alias: "Казахстан", lang: "ru"}
+      - {alias: "РК", lang: "ru"}
+      - {alias: "Республика Казахстан", lang: "ru"}
+      - {alias: "Kazakhstan", lang: "en"}
+
+  - canonical_name: "Касым-Жомарт Токаев"
+    type: "person"
+    aliases:
+      - {alias: "Касым-Жомарт Токаев", lang: "ru"}
+      - {alias: "Токаев", lang: "ru"}
+      - {alias: "Kassym-Jomart Tokayev", lang: "en"}
+      - {alias: "Tokayev", lang: "en"}
+
+  - canonical_name: "Россия"
+    type: "place"
+    aliases:
+      - {alias: "Россия", lang: "ru"}
+      - {alias: "РФ", lang: "ru"}
+      - {alias: "Российская Федерация", lang: "ru"}
+      - {alias: "Russia", lang: "en"}

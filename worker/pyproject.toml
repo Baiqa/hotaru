@@ -1,0 +1,41 @@
+[project]
+name = "hotaru-worker"
+version = "0.1.0"
+description = "Сбор статей (RSS), извлечение сущностей, эмбеддинги, кластеризация событий"
+authors = [
+    { name = "Baiqa", email = "madiarbaigabatov@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "en-core-web-sm",
+    "feedparser>=6.0.14",
+    "google-genai>=2.25.0",
+    "httpx>=0.28.1",
+    "pgvector>=0.5.0",
+    "psycopg[binary]>=3.3.6",
+    "pymorphy3>=2.0.6",
+    "pymorphy3-dicts-ru>=2.4.417150.4580142",
+    "python-dotenv>=1.2.3",
+    "pyyaml>=6.0.3",
+    "rapidfuzz>=3.14.6",
+    "ru-core-news-sm",
+    "spacy>=3.8.16",
+    "trafilatura>=2.2.0",
+]
+
+[project.scripts]
+hotaru-collect = "hotaru_worker.collect:main"
+hotaru-scheduler = "hotaru_worker.scheduler:main"
+hotaru-extract-entities = "hotaru_worker.extract_entities:main"
+hotaru-embed-articles = "hotaru_worker.embed_articles:main"
+hotaru-cluster-events = "hotaru_worker.cluster_events:main"
+hotaru-merge-events = "hotaru_worker.event_merge:main"
+hotaru-split-events = "hotaru_worker.event_split:main"
+
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+ru-core-news-sm = { url = "https://github.com/explosion/spacy-models/releases/download/ru_core_news_sm-3.8.0/ru_core_news_sm-3.8.0-py3-none-any.whl" }
+en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }

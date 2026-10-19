@@ -1,0 +1,16 @@
+# секреты
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Node / Next.js (появится в frontend-части)
+node_modules/
+.next/
+
+# ОС
+.DS_Store
+Thumbs.db

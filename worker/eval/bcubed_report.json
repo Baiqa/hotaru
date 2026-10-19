@@ -1,0 +1,8 @@
+{
+  "labeled_articles": 250,
+  "precision": 0.9270769230769231,
+  "recall": 0.8968588744588745,
+  "f1": 0.911717580071507,
+  "goal_threshold": 0.8,
+  "goal_met": true
+}
