@@ -6,6 +6,7 @@ import psycopg
 from pgvector.psycopg import register_vector
 from psycopg import errors as pg_errors
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 logger = logging.getLogger(__name__)
 
@@ -625,3 +626,11 @@ def insert_article(conn, article: dict) -> str:
         return "inserted"
     except pg_errors.UniqueViolation:
         return "duplicate"
+
+
+def save_monitoring_check(conn, check_name: str, status: str, details: dict) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "insert into monitoring_checks (check_name, status, details) values (%s, %s, %s)",
+            (check_name, status, Jsonb(details)),
+        )
