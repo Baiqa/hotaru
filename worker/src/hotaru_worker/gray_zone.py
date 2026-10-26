@@ -9,10 +9,11 @@ from google.genai import errors, types
 
 logger = logging.getLogger(__name__)
 
-# TODO: временно на preview-модели — 2026-09-27 стабильная gemini-3.1-flash-lite
-# держала устойчивый 503 "high demand" даже после ~7 минут retry (backoff до 120с).
-# Вернуться на gemini-3.1-flash-lite, когда у Google отпустит нагрузку.
-MODEL = "gemini-3.1-flash-lite-preview"
+# Было временно на preview-модели (2026-09-27: стабильная gemini-3.1-flash-lite держала
+# устойчивый 503 "high demand"). 2026-10-20: ситуация обратная — preview держит устойчивый
+# 503 почти 2 часа подряд, стабильная отвечает нормально. Вернулись на стабильную; если
+# она снова начнёт 503-ить пачками — это известный паттерн у Google, не баг в коде.
+MODEL = "gemini-3.1-flash-lite"
 MAX_RETRIES = 8
 INITIAL_BACKOFF_SECONDS = 5
 MAX_BACKOFF_SECONDS = 120

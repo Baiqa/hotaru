@@ -192,6 +192,53 @@ def mark_entities_extracted(conn, article_id: str) -> None:
         )
 
 
+def articles_missing_claims(conn, limit: int) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select id, title, lead, body, published_at
+            from articles
+            where claims_extracted_at is null and fetch_status = 'ok' and body is not null
+            order by published_at nulls last
+            limit %s
+            """,
+            (limit,),
+        )
+        return cur.fetchall()
+
+
+def insert_claims(conn, article_id: str, claims: list[dict]) -> None:
+    """Вставляет claims, выживших после проверки evidence (claim_extraction.py), и их
+    числа. Пустой claims — не ошибка (статья без чётких фактов), просто ничего не вставляем."""
+    with conn.cursor() as cur:
+        for claim in claims:
+            cur.execute(
+                """
+                insert into claims (article_id, text, type, evidence)
+                values (%s, %s, %s, %s)
+                returning id
+                """,
+                (article_id, claim["text"], claim["type"], claim["evidence"]),
+            )
+            claim_id = cur.fetchone()["id"]
+            for number in claim["numbers"]:
+                cur.execute(
+                    """
+                    insert into claim_numbers (claim_id, value, unit, label, period)
+                    values (%s, %s, %s, %s, %s)
+                    """,
+                    (claim_id, number["value"], number["unit"], number["label"], number["period"]),
+                )
+
+
+def mark_claims_extracted(conn, article_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "update articles set claims_extracted_at = now() where id = %s",
+            (article_id,),
+        )
+
+
 def articles_missing_embedding(conn, limit: int) -> list[dict]:
     with conn.cursor() as cur:
         cur.execute(
