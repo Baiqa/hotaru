@@ -240,6 +240,165 @@ def mark_claims_extracted(conn, article_id: str) -> None:
         )
 
 
+def claims_missing_embedding(conn, limit: int) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "select id, text from claims where embedding is null order by created_at limit %s",
+            (limit,),
+        )
+        return cur.fetchall()
+
+
+def update_claim_embedding(conn, claim_id: str, vector: list[float]) -> None:
+    with conn.cursor() as cur:
+        cur.execute("update claims set embedding = %s where id = %s", (vector, claim_id))
+
+
+def claims_missing_group(conn, limit: int) -> list[dict]:
+    """Claims без группы, но только у статей, уже попавших в событие (inner join —
+    claim статьи без события сам пока не дошёл до кластеризации, появится в следующем
+    прогоне после articles_missing_event, а не застрянет здесь молча)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select c.id, c.article_id, c.text, c.evidence, c.embedding, ea.event_id
+            from claims c
+            join event_articles ea on ea.article_id = c.article_id
+            left join claim_group_members cgm on cgm.claim_id = c.id
+            where cgm.claim_id is null and c.embedding is not null
+            order by c.created_at
+            limit %s
+            """,
+            (limit,),
+        )
+        return cur.fetchall()
+
+
+def event_claim_groups(conn, event_id: str) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "select id, bucket, source_count, centroid from claim_groups where event_id = %s",
+            (event_id,),
+        )
+        return cur.fetchall()
+
+
+def claim_group_representative(conn, claim_group_id: str) -> dict:
+    """Текст/evidence самого раннего (founding) члена группы — используется как
+    образец для LLM-классификации новой claim против этой группы."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select c.text, c.evidence
+            from claim_group_members m
+            join claims c on c.id = m.claim_id
+            where m.claim_group_id = %s
+            order by m.joined_at asc
+            limit 1
+            """,
+            (claim_group_id,),
+        )
+        return cur.fetchone()
+
+
+def claim_group_numbers_conflict(conn, claim_group_id: str, claim_id: str) -> bool:
+    """Есть ли у нового claim число с тем же label/period, но другим value, чем у
+    любого уже состоящего в группе claim — сигнал расхождения даже при высокой
+    текстовой близости (напр. разные версии размера ставки)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select exists (
+                select 1
+                from claim_numbers n1
+                join claim_group_members m on m.claim_id = n1.claim_id
+                join claim_numbers n2 on n2.claim_id = %(claim_id)s
+                where m.claim_group_id = %(group_id)s
+                  and n1.label is not distinct from n2.label
+                  and n1.period is not distinct from n2.period
+                  and n1.value != n2.value
+            ) as conflict
+            """,
+            {"claim_id": claim_id, "group_id": claim_group_id},
+        )
+        return cur.fetchone()["conflict"]
+
+
+def create_claim_group(conn, event_id: str, claim_id: str, embedding) -> str:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into claim_groups (event_id, bucket, source_count, centroid)
+            values (%s, 'unique', 1, %s)
+            returning id
+            """,
+            (event_id, embedding),
+        )
+        group_id = cur.fetchone()["id"]
+        cur.execute(
+            """
+            insert into claim_group_members (claim_id, claim_group_id, relation, similarity_score)
+            values (%s, %s, 'confirms', null)
+            """,
+            (claim_id, group_id),
+        )
+    return group_id
+
+
+def add_claim_group_member(conn, claim_group_id: str, claim_id: str, relation: str, similarity_score: float) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into claim_group_members (claim_id, claim_group_id, relation, similarity_score)
+            values (%s, %s, %s, %s)
+            """,
+            (claim_id, claim_group_id, relation, similarity_score),
+        )
+
+
+def recompute_claim_group(conn, claim_group_id: str) -> None:
+    """Полный пересчёт centroid/source_count/bucket — группы маленькие, дёшево.
+    bucket: disputed, если есть хоть один relation='contradicts'; иначе confirmed при
+    source_count>=2 (считаем по изданиям, не по статьям — см. tmp/plans); иначе unique."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select c.embedding
+            from claim_group_members m
+            join claims c on c.id = m.claim_id
+            where m.claim_group_id = %s and c.embedding is not null
+            """,
+            (claim_group_id,),
+        )
+        vectors = [row["embedding"].to_list() for row in cur.fetchall()]
+        centroid = [sum(coords) / len(vectors) for coords in zip(*vectors)] if vectors else None
+
+        cur.execute(
+            """
+            select count(distinct a.source_id) as source_count
+            from claim_group_members m
+            join claims c on c.id = m.claim_id
+            join articles a on a.id = c.article_id
+            where m.claim_group_id = %s
+            """,
+            (claim_group_id,),
+        )
+        source_count = cur.fetchone()["source_count"]
+
+        cur.execute(
+            "select exists(select 1 from claim_group_members where claim_group_id = %s and relation = 'contradicts') as has_conflict",
+            (claim_group_id,),
+        )
+        has_conflict = cur.fetchone()["has_conflict"]
+
+        bucket = "disputed" if has_conflict else ("confirmed" if source_count >= 2 else "unique")
+
+        cur.execute(
+            "update claim_groups set centroid = %s, source_count = %s, bucket = %s where id = %s",
+            (centroid, source_count, bucket, claim_group_id),
+        )
+
+
 def articles_missing_embedding(conn, limit: int) -> list[dict]:
     with conn.cursor() as cur:
         cur.execute(
@@ -634,3 +793,98 @@ def save_monitoring_check(conn, check_name: str, status: str, details: dict) -> 
             "insert into monitoring_checks (check_name, status, details) values (%s, %s, %s)",
             (check_name, status, Jsonb(details)),
         )
+
+
+def events_missing_render(conn, limit: int) -> list[dict]:
+    """События без summary_30s render, у которых есть хотя бы один claim — нет
+    смысла синтезировать текст для события без фактов. Не ждёт завершения
+    embedding/группировки claims (раздел 3.4: синтез работает по фактам события,
+    группировка только уточняет bucket — см. event_facts_for_synthesis)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select e.id, e.title
+            from events e
+            where e.status = 'active'
+              and exists (
+                select 1 from event_articles ea join claims c on c.article_id = ea.article_id
+                where ea.event_id = e.id
+              )
+              and (
+                select count(*) from renders r where r.event_id = e.id
+              ) < 2
+            order by e.started_at
+            limit %s
+            """,
+            (limit,),
+        )
+        return cur.fetchall()
+
+
+def event_facts_for_synthesis(conn, event_id: str) -> list[dict]:
+    """Факты события для синтеза (раздел 3.4 CLAUDE.md) — модель-синтезатор видит
+    ТОЛЬКО это, не исходные статьи. bucket по умолчанию 'unique', если claim ещё не
+    дошёл до группировки (claims_missing_group работает в фоне отдельно) — так
+    синтез не блокируется незавершённой группировкой, просто консервативно считает
+    факт пока неподтверждённым."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select c.id as claim_id, c.text, c.evidence, c.type,
+                   s.name as source_name, a.url as source_url,
+                   coalesce(cg.bucket, 'unique') as bucket,
+                   coalesce(cg.source_count, 1) as source_count
+            from claims c
+            join articles a on a.id = c.article_id
+            join sources s on s.id = a.source_id
+            join event_articles ea on ea.article_id = c.article_id
+            left join claim_group_members cgm on cgm.claim_id = c.id
+            left join claim_groups cg on cg.id = cgm.claim_group_id
+            where ea.event_id = %s
+            order by c.created_at
+            """,
+            (event_id,),
+        )
+        claims = cur.fetchall()
+        if not claims:
+            return []
+
+        claim_ids = [row["claim_id"] for row in claims]
+        cur.execute(
+            "select claim_id, value, unit, label, period from claim_numbers where claim_id = any(%s)",
+            (claim_ids,),
+        )
+        numbers_by_claim: dict[str, list[dict]] = {}
+        for row in cur.fetchall():
+            numbers_by_claim.setdefault(row["claim_id"], []).append(
+                {"value": float(row["value"]), "unit": row["unit"], "label": row["label"], "period": row["period"]}
+            )
+        for row in claims:
+            row["numbers"] = numbers_by_claim.get(row["claim_id"], [])
+        return claims
+
+
+def save_render(
+    conn, event_id: str, format: str, lang: str, body: str, model: str, sentence_claims: list[list[str]]
+) -> None:
+    """Апсерт render + полная замена его render_claims — безопасно для повторного
+    запуска (не копит дубликаты предложений при перегенерации)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into renders (event_id, format, lang, body, model)
+            values (%s, %s, %s, %s, %s)
+            on conflict (event_id, format, lang)
+            do update set body = excluded.body, model = excluded.model, updated_at = now()
+            returning id
+            """,
+            (event_id, format, lang, body, model),
+        )
+        render_id = cur.fetchone()["id"]
+        cur.execute("delete from render_claims where render_id = %s", (render_id,))
+        for sentence_index, claim_ids in enumerate(sentence_claims):
+            for claim_id in claim_ids:
+                cur.execute(
+                    "insert into render_claims (render_id, sentence_index, claim_id) values (%s, %s, %s)",
+                    (render_id, sentence_index, claim_id),
+                )

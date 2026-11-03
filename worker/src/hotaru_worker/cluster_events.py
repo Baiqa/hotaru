@@ -3,6 +3,7 @@ import logging
 import httpx
 from google import genai
 from google.genai import errors as genai_errors
+from google.genai import types
 from psycopg import OperationalError
 
 from . import clustering, config, db
@@ -11,11 +12,14 @@ logger = logging.getLogger("hotaru_worker.cluster_events")
 
 BATCH_SIZE = 50
 MAX_CONSECUTIVE_FAILURES = 5
+# См. embeddings.py: без явного таймаута зависший запрос к Gemini не попадает ни
+# в один except и висит часами с нулевой загрузкой CPU (случай 2026-11-03).
+_HTTP_TIMEOUT_MS = 30_000
 
 
 def run_once() -> dict:
     cfg = config.load()
-    client = genai.Client()
+    client = genai.Client(http_options=types.HttpOptions(timeout=_HTTP_TIMEOUT_MS))
 
     stats = {"processed": 0, "new_events": 0, "joined": 0, "skipped_llm_unavailable": 0}
 
