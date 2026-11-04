@@ -128,7 +128,7 @@ function toEventDetail(row: EventListRow): EventDetail {
 // умирать". Поглощённое при merge событие остаётся в таблице со status='merged'
 // и пустым event_articles (их перенесли на канонического победителя) — поэтому
 // сюда нельзя просто сходить по id, нужно сначала дойти до живого события.
-async function resolveActiveEventId(id: string): Promise<string | null> {
+export async function resolveActiveEventId(id: string): Promise<string | null> {
   let currentId = id;
   for (let hop = 0; hop < MAX_CANONICAL_HOPS; hop++) {
     const { data, error } = await supabase

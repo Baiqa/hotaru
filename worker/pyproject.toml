@@ -36,6 +36,7 @@ hotaru-split-events = "hotaru_worker.event_split:main"
 hotaru-embed-claims = "hotaru_worker.embed_claims:main"
 hotaru-group-claims = "hotaru_worker.group_claims:main"
 hotaru-synthesize = "hotaru_worker.synthesize:main"
+hotaru-fetch-metrics = "hotaru_worker.metrics:main"
 hotaru-monitor = "hotaru_worker.monitor:main"
 
 [build-system]

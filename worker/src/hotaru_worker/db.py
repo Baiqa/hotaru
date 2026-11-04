@@ -888,3 +888,35 @@ def save_render(
                     "insert into render_claims (render_id, sentence_index, claim_id) values (%s, %s, %s)",
                     (render_id, sentence_index, claim_id),
                 )
+
+
+def upsert_metric_series(conn, key: str, label: str, unit: str, source_name: str, source_url: str) -> str:
+    """Этап 3 MVP: ключ 'indicator:country' уникален, повторный запуск обновляет
+    метаданные на месте (на случай смены подписи/ссылки), не плодя дубликаты."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into metric_series (key, label, unit, source_name, source_url)
+            values (%s, %s, %s, %s, %s)
+            on conflict (key) do update set
+                label = excluded.label, unit = excluded.unit,
+                source_name = excluded.source_name, source_url = excluded.source_url,
+                updated_at = now()
+            returning id
+            """,
+            (key, label, unit, source_name, source_url),
+        )
+        return cur.fetchone()["id"]
+
+
+def upsert_metric_points(conn, series_id: str, points: list[dict]) -> None:
+    with conn.cursor() as cur:
+        for point in points:
+            cur.execute(
+                """
+                insert into metric_points (series_id, period, value)
+                values (%s, %s, %s)
+                on conflict (series_id, period) do update set value = excluded.value
+                """,
+                (series_id, point["period"], point["value"]),
+            )
