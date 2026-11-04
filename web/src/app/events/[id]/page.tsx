@@ -73,6 +73,13 @@ export default async function EventPage({
           {formatDate(event.updatedAt)}
         </p>
 
+        <Link
+          href={`/events/${id}/compare`}
+          className="text-sm text-zinc-600 hover:underline dark:text-zinc-400"
+        >
+          Сравнить подачи →
+        </Link>
+
         {render ? (
           <ul className="mt-2 flex flex-col gap-2">
             {render.sentences.map((sentence, i) =>
