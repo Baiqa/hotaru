@@ -6,7 +6,7 @@ from google.genai import errors as genai_errors
 from google.genai import types
 from psycopg import OperationalError
 
-from . import claim_grouping, config, db
+from . import claim_grouping, config, db, quota
 
 logger = logging.getLogger("hotaru_worker.group_claims")
 
@@ -20,6 +20,19 @@ _HTTP_TIMEOUT_MS = 30_000
 def run_once() -> dict:
     cfg = config.load()
     client = genai.Client(http_options=types.HttpOptions(timeout=_HTTP_TIMEOUT_MS))
+
+    # claims_missing_group не помечает claim как обработанный при пропуске —
+    # без этой проверки исчерпанная дневная квота зацикливает внешний while True
+    # на одном батче навсегда (2026-11-05).
+    if not quota.has_quota(client, claim_grouping.MODEL):
+        return {
+            "processed": 0,
+            "new_groups": 0,
+            "confirmed": 0,
+            "contradicted": 0,
+            "skipped_llm_unavailable": 0,
+            "skipped_quota_exhausted": True,
+        }
 
     stats = {"processed": 0, "new_groups": 0, "confirmed": 0, "contradicted": 0, "skipped_llm_unavailable": 0}
 

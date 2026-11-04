@@ -4,7 +4,7 @@ import httpx
 from google.genai import errors as genai_errors
 from psycopg import OperationalError
 
-from . import config, db, synthesis
+from . import config, db, quota, synthesis
 
 logger = logging.getLogger("hotaru_worker.synthesize")
 
@@ -16,6 +16,12 @@ FORMATS = ("summary_30s", "full_breakdown")
 def run_once() -> dict:
     cfg = config.load()
     client = synthesis.build_client()
+
+    # events_missing_render не помечает событие как обработанное при пропуске —
+    # без этой проверки исчерпанная дневная квота зацикливает внешний while True
+    # на одном батче навсегда (2026-11-05).
+    if not quota.has_quota(client, synthesis.MODEL):
+        return {"events_processed": 0, "renders_written": 0, "skipped": 0, "skipped_quota_exhausted": True}
 
     stats = {"events_processed": 0, "renders_written": 0, "skipped": 0}
 
