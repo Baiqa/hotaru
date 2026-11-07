@@ -32,6 +32,7 @@ def run_once() -> dict:
                 batch = db.articles_missing_claims(conn, BATCH_SIZE)
                 if not batch:
                     break
+                made_progress = False
                 for article in batch:
                     try:
                         claims = claim_extraction.extract_claims(client, article)
@@ -43,6 +44,14 @@ def run_once() -> dict:
                     db.mark_claims_extracted(conn, article["id"])
                     stats["processed"] += 1
                     stats["claims_found"] += len(claims)
+                    made_progress = True
+                if not made_progress:
+                    # Весь батч пропущен (квота/перегрузка Gemini): пропущенные статьи
+                    # остаются в articles_missing_claims, и без этого выхода внешний
+                    # цикл вечно перечитывал бы тот же батч (см. quota.py, тот же баг
+                    # был в group_claims/synthesize). Статьи подберёт следующий запуск.
+                    logger.warning("ни одна статья батча не обработана, завершаю прогон")
+                    break
             consecutive_failures = 0
         except OperationalError:
             consecutive_failures += 1

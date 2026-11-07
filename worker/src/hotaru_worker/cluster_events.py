@@ -34,6 +34,7 @@ def run_once() -> dict:
                 batch = db.articles_missing_event(conn, BATCH_SIZE)
                 if not batch:
                     break
+                made_progress = False
                 for article in batch:
                     # Батч выбран один раз в начале итерации — пока обрабатывается
                     # более ранняя статья, самовосстановление в clustering.py
@@ -42,6 +43,7 @@ def run_once() -> dict:
                     # кандидатом. Пропускаем, иначе повторная вставка в
                     # event_articles упадёт на дубликате ключа (article_id — PK).
                     if db.event_id_for_article(conn, article["id"]) is not None:
+                        made_progress = True
                         continue
                     try:
                         _, created = clustering.cluster_article(conn, client, article)
@@ -56,6 +58,14 @@ def run_once() -> dict:
                         continue
                     stats["processed"] += 1
                     stats["new_events" if created else "joined"] += 1
+                    made_progress = True
+                if not made_progress:
+                    # Весь батч пропущен (квота/перегрузка Gemini): пропущенные статьи
+                    # остаются в articles_missing_event, и без этого выхода внешний
+                    # цикл вечно перечитывал бы тот же батч (см. quota.py, тот же баг
+                    # был в group_claims/synthesize). Статьи подберёт следующий запуск.
+                    logger.warning("ни одна статья батча не обработана, завершаю прогон")
+                    break
             consecutive_failures = 0
         except OperationalError:
             consecutive_failures += 1
