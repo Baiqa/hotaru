@@ -1,0 +1,50 @@
+name: collect
+
+# Сбор статей и первичная обработка: RSS -> сущности -> эмбеддинги -> события.
+# Только расписание и ручной запуск (никаких pull_request: секреты не должны
+# попадать в код, запускаемый из форков публичного репозитория).
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Одна группа с merge/assign/split: все они пишут события, параллельно не гоняем.
+concurrency:
+  group: hotaru-events-writers
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: worker/uv.lock
+      - run: uv sync --frozen
+
+      # Каждый следующий шаг идемпотентен и подбирает необработанное, поэтому
+      # сбой одного шага не должен блокировать остальные (job всё равно станет красным).
+      - name: Collect RSS
+        run: uv run --frozen hotaru-collect
+      - name: Extract entities
+        if: ${{ !cancelled() }}
+        run: uv run --frozen hotaru-extract-entities
+      - name: Embed articles
+        if: ${{ !cancelled() }}
+        run: uv run --frozen hotaru-embed-articles
+      - name: Cluster events
+        if: ${{ !cancelled() }}
+        run: uv run --frozen hotaru-cluster-events

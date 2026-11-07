@@ -1,0 +1,42 @@
+name: maintenance-daily
+
+# Раз в сутки: разделение событий (§3.3), исторические ряды World Bank (§3.5),
+# мониторинг пайплайна (§6). Gemini не используют.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hotaru-events-writers
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: worker/uv.lock
+      - run: uv sync --frozen
+
+      - name: Split events
+        run: uv run --frozen hotaru-split-events
+      - name: Fetch World Bank series
+        if: ${{ !cancelled() }}
+        run: uv run --frozen hotaru-fetch-metrics
+      - name: Pipeline monitoring
+        if: ${{ !cancelled() }}
+        run: uv run --frozen hotaru-monitor

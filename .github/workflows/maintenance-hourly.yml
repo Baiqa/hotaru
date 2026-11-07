@@ -1,0 +1,39 @@
+name: maintenance-hourly
+
+# Слияние событий (CLAUDE.md §3.3, раз в час) и привязка событий к сюжетам.
+# Gemini не используют.
+on:
+  schedule:
+    - cron: "40 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hotaru-events-writers
+  cancel-in-progress: false
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: worker/uv.lock
+      - run: uv sync --frozen
+
+      - name: Merge events
+        run: uv run --frozen hotaru-merge-events
+      - name: Assign events to stories
+        if: ${{ !cancelled() }}
+        run: uv run --frozen hotaru-assign-stories

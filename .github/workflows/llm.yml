@@ -1,0 +1,47 @@
+name: llm
+
+# Факты, группировка и синтез текста. Делят дневную квоту Gemini (free tier),
+# поэтому идут одной цепочкой и раз в час; при исчерпанной квоте шаги
+# завершаются за секунды (quota.has_quota / выход при батче без прогресса).
+on:
+  schedule:
+    - cron: "10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hotaru-llm
+  cancel-in-progress: false
+
+jobs:
+  llm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: worker/uv.lock
+      - run: uv sync --frozen
+
+      - name: Extract claims
+        run: uv run --frozen hotaru-extract-claims
+      - name: Embed claims
+        if: ${{ !cancelled() }}
+        run: uv run --frozen hotaru-embed-claims
+      - name: Group claims
+        if: ${{ !cancelled() }}
+        run: uv run --frozen hotaru-group-claims
+      - name: Synthesize event texts
+        if: ${{ !cancelled() }}
+        run: uv run --frozen hotaru-synthesize
