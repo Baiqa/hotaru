@@ -920,3 +920,155 @@ def upsert_metric_points(conn, series_id: str, points: list[dict]) -> None:
                 """,
                 (series_id, point["period"], point["value"]),
             )
+
+
+def events_missing_story(conn) -> list[dict]:
+    """Этап 4: активные события с центроидом, ещё не привязанные ни к одному
+    сюжету (story_events.event_id — PK, один event принадлежит ровно одному
+    story, по аналогии с event_articles.article_id)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select e.id, e.title, e.centroid, e.started_at
+            from events e
+            where e.status = 'active'
+              and e.centroid is not null
+              and not exists (select 1 from story_events se where se.event_id = e.id)
+            order by e.started_at
+            """
+        )
+        return cur.fetchall()
+
+
+def find_similar_stories(
+    conn,
+    centroid,
+    entity_ids: list[str],
+    window_days: int,
+    started_at,
+    limit: int,
+    recent_k: int,
+    min_sharing: int,
+    max_story_size: int,
+) -> list[dict]:
+    """Кандидаты-сюжеты для события. Сравнение идёт не с центроидом сюжета, а с
+    последними `recent_k` участниками (CLAUDE.md §3.3, «дрейф»): центроид сюжета
+    усредняет всё присоединённое и дрейфует к «средней новости», после чего к
+    нему проходит почти любое событие (случай 2026-11-07: сюжеты на 376/295
+    событий, см. tmp/plans/etap4-ispravlenie-syuzhetov.md).
+
+    cosine_sim — максимум по последним участникам. Фильтры: окно по времени
+    относительно самого свежего из них; общая сущность хотя бы у `min_sharing`
+    из последних участников (меньше, если их в сюжете меньше); потолок размера
+    сюжета как страховка от цепного разрастания."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            with recent as (
+              select se.story_id, se.event_id, e.centroid, e.started_at,
+                     row_number() over (partition by se.story_id order by e.started_at desc) as rn,
+                     count(*) over (partition by se.story_id) as story_size
+              from story_events se
+              join events e on e.id = se.event_id
+              join stories s on s.id = se.story_id
+              where s.status = 'active' and e.centroid is not null
+            ),
+            scored as (
+              select r.story_id, r.story_size, r.started_at,
+                     1 - (r.centroid <=> %(centroid)s) as sim,
+                     exists (
+                       select 1 from event_articles ea
+                       join article_entities ae on ae.article_id = ea.article_id
+                       where ea.event_id = r.event_id and ae.entity_id = any(%(entity_ids)s)
+                     ) as shares
+              from recent r
+              where r.rn <= %(recent_k)s
+            )
+            select story_id as id,
+                   max(sim) as cosine_sim,
+                   max(story_size) as story_size
+            from scored
+            group by story_id
+            having max(started_at) between %(from)s and %(to)s
+               and max(story_size) < %(max_story_size)s
+               and count(*) filter (where shares) >= least(%(min_sharing)s, count(*))
+            order by max(sim) desc
+            limit %(limit)s
+            """,
+            {
+                "centroid": centroid,
+                "entity_ids": entity_ids,
+                "from": started_at - timedelta(days=window_days),
+                "to": started_at + timedelta(days=window_days),
+                "limit": limit,
+                "recent_k": recent_k,
+                "min_sharing": min_sharing,
+                "max_story_size": max_story_size,
+            },
+        )
+        return cur.fetchall()
+
+
+def create_story(conn, event: dict) -> str:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into stories (title, started_at, centroid)
+            values (%(title)s, %(started_at)s, %(centroid)s)
+            returning id
+            """,
+            event,
+        )
+        story_id = cur.fetchone()["id"]
+        cur.execute(
+            "insert into story_events (event_id, story_id, position) values (%s, %s, 1)",
+            (event["id"], story_id),
+        )
+        return story_id
+
+
+def assign_event_to_story(conn, event_id: str, story_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "insert into story_events (event_id, story_id, position) values (%s, %s, 0)",
+            (event_id, story_id),
+        )
+    # position=0 выше временный — recompute_story_positions сразу расставляет
+    # по started_at, как recompute_event_centroid делает полный, не
+    # инкрементальный пересчёт у событий.
+    recompute_story_centroid(conn, story_id)
+    recompute_story_positions(conn, story_id)
+
+
+def recompute_story_centroid(conn, story_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "select e.centroid from events e join story_events se on se.event_id = e.id where se.story_id = %s",
+            (story_id,),
+        )
+        vectors = [row["centroid"].to_list() for row in cur.fetchall()]
+        if not vectors:
+            return
+        centroid = [sum(coords) / len(vectors) for coords in zip(*vectors)]
+        cur.execute("update stories set centroid = %s, updated_at = now() where id = %s", (centroid, story_id))
+
+
+def recompute_story_positions(conn, story_id: str) -> None:
+    # Один UPDATE вместо N отдельных (по мере роста сюжета N запросов по сети
+    # замедляли прогон: ~1 событие в несколько секунд на сюжетах из сотен).
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            update story_events se
+            set position = r.pos
+            from (
+              select se2.event_id,
+                     row_number() over (order by e.started_at, se2.event_id) as pos
+              from story_events se2
+              join events e on e.id = se2.event_id
+              where se2.story_id = %(story_id)s
+            ) r
+            where se.event_id = r.event_id and se.story_id = %(story_id)s
+            """,
+            {"story_id": story_id},
+        )

@@ -5,6 +5,7 @@ import { formatDate } from "@/lib/format-date";
 import { getEventRender, type CitedClaim, type ClaimBucket } from "@/lib/renders";
 import { getMetricChartData, matchMetric, type AllowlistRule, type MetricChartData } from "@/lib/metrics";
 import { MetricLineChart } from "@/components/MetricLineChart";
+import { getStoryForEvent } from "@/lib/stories";
 
 export const dynamic = "force-dynamic";
 
@@ -54,6 +55,7 @@ export default async function EventPage({
   const render = await getEventRender(id, "summary_30s");
   const allClaims = render?.sentences.flatMap((s) => s.claims) ?? [];
   const metricCharts = await loadMetricCharts(allClaims);
+  const story = await getStoryForEvent(id);
 
   return (
     <main className="mx-auto flex max-w-2xl flex-1 flex-col px-4 py-8 sm:px-6">
@@ -73,12 +75,22 @@ export default async function EventPage({
           {formatDate(event.updatedAt)}
         </p>
 
-        <Link
-          href={`/events/${id}/compare`}
-          className="text-sm text-zinc-600 hover:underline dark:text-zinc-400"
-        >
-          Сравнить подачи →
-        </Link>
+        <div className="flex flex-wrap gap-4">
+          <Link
+            href={`/events/${id}/compare`}
+            className="text-sm text-zinc-600 hover:underline dark:text-zinc-400"
+          >
+            Сравнить подачи →
+          </Link>
+          {story && (
+            <Link
+              href={`/stories/${story.id}`}
+              className="text-sm text-zinc-600 hover:underline dark:text-zinc-400"
+            >
+              Сюжет: {story.title} →
+            </Link>
+          )}
+        </div>
 
         {render ? (
           <ul className="mt-2 flex flex-col gap-2">
