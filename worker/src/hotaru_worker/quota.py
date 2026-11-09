@@ -5,6 +5,23 @@ from google.genai import errors, types
 
 logger = logging.getLogger("hotaru_worker.quota")
 
+# Флаг на процесс (2026-11-09): живой тест Groq-фолбэка показал, что без него
+# прогон с полностью мёртвой Gemini-квотой всё равно жжёт полный retry-бюджет
+# Gemini (MODEL+FALLBACK_MODEL, до ~150с) на КАЖДОМ claim/событии, прежде чем
+# упасть в Groq — на 3000+ claims это заняло бы сутки вместо часов. Один
+# модуль-процесс = один run_once(), поэтому глобальный флаг безопасен (не
+# переживает рестарт процесса, что и нужно — вдруг квота обновится).
+_gemini_dead_this_run = False
+
+
+def mark_gemini_dead() -> None:
+    global _gemini_dead_this_run
+    _gemini_dead_this_run = True
+
+
+def gemini_dead_this_run() -> bool:
+    return _gemini_dead_this_run
+
 
 def has_quota(client: genai.Client, model: str) -> bool:
     """Дешёвая проверка перед батчем. Free-tier — 500 generate_content/день

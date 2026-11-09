@@ -16,6 +16,7 @@ class Settings:
     http_timeout_seconds: float
     sources_file: Path
     aliases_file: Path
+    groq_api_key: str | None
 
 
 def load() -> Settings:
@@ -41,6 +42,10 @@ def load() -> Settings:
     http_timeout_seconds = float(os.environ.get("HTTP_TIMEOUT_SECONDS", "15"))
     sources_file = Path(os.environ.get("SOURCES_FILE", PACKAGE_DIR / "sources.yaml"))
     aliases_file = Path(os.environ.get("ALIASES_FILE", PACKAGE_DIR / "aliases_seed.yaml"))
+    # Опциональный третий уровень fallback (2026-11-08, groq_client.py) —
+    # без RuntimeError, в отличие от DATABASE_URL/CONTACT_EMAIL: код должен
+    # работать и без ключа, просто не используя Groq.
+    groq_api_key = os.environ.get("GROQ_API_KEY")
 
     return Settings(
         database_url=database_url,
@@ -49,6 +54,7 @@ def load() -> Settings:
         http_timeout_seconds=http_timeout_seconds,
         sources_file=sources_file,
         aliases_file=aliases_file,
+        groq_api_key=groq_api_key,
     )
 
 

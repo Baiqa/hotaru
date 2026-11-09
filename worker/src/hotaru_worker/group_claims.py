@@ -23,16 +23,26 @@ def run_once() -> dict:
 
     # claims_missing_group не помечает claim как обработанный при пропуске —
     # без этой проверки исчерпанная дневная квота зацикливает внешний while True
-    # на одном батче навсегда (2026-11-05).
-    if not quota.has_quota(client, claim_grouping.MODEL):
-        return {
-            "processed": 0,
-            "new_groups": 0,
-            "confirmed": 0,
-            "contradicted": 0,
-            "skipped_llm_unavailable": 0,
-            "skipped_quota_exhausted": True,
-        }
+    # на одном батче навсегда (2026-11-05). Но если настроен Groq-фолбэк
+    # (2026-11-08) — смоук-тест только Gemini больше не надёжен: Gemini может
+    # быть мёртв, а Groq жив, и per-claim цепочка (claim_grouping.py) сама
+    # разберётся. Пропускаем ранний выход, когда есть кем подстраховаться — но
+    # смоук-тест всё равно даёт самый дешёвый сигнал "Gemini уже мёртв сейчас",
+    # так что сразу помечаем quota.mark_gemini_dead() (2026-11-09, живой тест
+    # показал: без этого первые ~N claims всё равно жгут retry-бюджет Gemini,
+    # прежде чем per-claim код сам это обнаружит).
+    gemini_ok = quota.has_quota(client, claim_grouping.MODEL)
+    if not gemini_ok:
+        quota.mark_gemini_dead()
+        if not cfg.groq_api_key:
+            return {
+                "processed": 0,
+                "new_groups": 0,
+                "confirmed": 0,
+                "contradicted": 0,
+                "skipped_llm_unavailable": 0,
+                "skipped_quota_exhausted": True,
+            }
 
     stats = {"processed": 0, "new_groups": 0, "confirmed": 0, "contradicted": 0, "skipped_llm_unavailable": 0}
 
@@ -48,22 +58,26 @@ def run_once() -> dict:
                 for claim in batch:
                     try:
                         outcome = claim_grouping.group_claim(conn, client, claim, claim["event_id"])
-                    except (genai_errors.APIError, httpx.TransportError) as exc:
+                    except (genai_errors.APIError, httpx.TransportError, httpx.HTTPStatusError) as exc:
                         # Смоук-тест перед батчем (выше) ловит только "квота уже
                         # мёртва на старте" — если она умирает СЕРЕДИНЕ батча,
                         # каждый claim по-прежнему жжёт свой полный retry-бюджет
-                        # (_classify_relation: до 2 моделей x MAX_RETRIES с backoff
-                        # до 60с, до 3 кандидатных групп на claim — реально до
-                        # нескольких минут на ОДИН claim), прежде чем попасть в этот
-                        # except. На 50 claims это часы впустую (обнаружено 2026-11-06:
-                        # прогон провисел >1ч, продвинувшись на considered claims).
-                        # 429 — трактуем как "квота кончилась именно сейчас" и
+                        # (_classify_relation: до 2 моделей Gemini x MAX_RETRIES с
+                        # backoff до 60с, плюс Groq, если настроен, до 3 кандидатных
+                        # групп на claim — реально до нескольких минут на ОДИН claim),
+                        # прежде чем попасть в этот except. На 50 claims это часы
+                        # впустую (обнаружено 2026-11-06: прогон провисел >1ч).
+                        # 429 (от Gemini ИЛИ, после добавления Groq 2026-11-08, от
+                        # него тоже) — трактуем как "квота кончилась именно сейчас" и
                         # прекращаем весь прогон немедленно, не тратя бюджет retry
                         # на заведомо обречённые оставшиеся claims. Другие транзиентные
                         # ошибки (5xx, сеть) — по-прежнему пропускаем claim и идём дальше,
                         # это реальные отдельные сбои, не признак дневного лимита.
-                        is_quota_wall = isinstance(exc, genai_errors.APIError) and exc.code == 429
-                        logger.warning("Gemini недоступна для claim %s (%s), пропускаю", claim["id"], exc)
+                        is_quota_wall = (
+                            (isinstance(exc, genai_errors.APIError) and exc.code == 429)
+                            or (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429)
+                        )
+                        logger.warning("Gemini/Groq недоступны для claim %s (%s), пропускаю", claim["id"], exc)
                         stats["skipped_llm_unavailable"] += 1
                         if is_quota_wall:
                             quota_died_mid_run = True

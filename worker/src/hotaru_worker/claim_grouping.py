@@ -1,5 +1,7 @@
 import enum
+import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -7,7 +9,7 @@ import httpx
 from google import genai
 from google.genai import errors, types
 
-from . import db
+from . import db, groq_client, quota
 
 logger = logging.getLogger(__name__)
 
@@ -83,16 +85,48 @@ def _call_model(client: genai.Client, model: str, prompt: str) -> Relation:
     raise AssertionError("unreachable")
 
 
+def _classify_relation_groq(api_key: str, prompt: str) -> Relation:
+    """Третий уровень fallback (2026-11-08) — после обеих моделей Gemini.
+    claim_relation_classify.txt просит "одним словом" под Gemini enum-режим
+    (response_schema=Relation); у Groq такой схемной привязки нет, поэтому
+    здесь — отдельная JSON-инструкция поверх общего промпта, не трогая сам
+    файл (он и дальше работает для Gemini как есть)."""
+    groq_prompt = prompt + (
+        '\n\nОтветь в формате JSON: {"relation": "confirms"} '
+        '(или "contradicts", или "different").'
+    )
+    content = groq_client.call_json(api_key, groq_prompt)
+    return Relation(json.loads(content)["relation"])
+
+
 def _classify_relation(client: genai.Client, candidate: dict, new_claim: dict) -> Relation:
     prompt = _PROMPT_TEMPLATE.format(
         text_a=candidate["text"], evidence_a=candidate["evidence"],
         text_b=new_claim["text"], evidence_b=new_claim["evidence"],
     )
+    groq_api_key = os.environ.get("GROQ_API_KEY")
+
+    # Живой тест 2026-11-09: без этой проверки прогон с мёртвой Gemini-квотой
+    # жжёт полный retry-бюджет Gemini (до ~150с) НА КАЖДОМ claim, прежде чем
+    # упасть в Groq — на 3000+ claims это заняло бы сутки. Если уже знаем, что
+    # Gemini мёртв в этом прогоне (смоук-тест или более ранний 429), сразу идём
+    # в Groq, не повторяя обречённые попытки.
+    if groq_api_key and quota.gemini_dead_this_run():
+        return _classify_relation_groq(groq_api_key, prompt)
+
     try:
         return _call_model(client, MODEL, prompt)
     except (errors.APIError, httpx.TransportError):
         logger.warning("основная модель %s не отвечает, пробую фолбэк %s", MODEL, FALLBACK_MODEL)
-        return _call_model(client, FALLBACK_MODEL, prompt)
+        try:
+            return _call_model(client, FALLBACK_MODEL, prompt)
+        except (errors.APIError, httpx.TransportError) as exc2:
+            if isinstance(exc2, errors.APIError) and exc2.code == 429:
+                quota.mark_gemini_dead()
+            if not groq_api_key:
+                raise
+            logger.warning("обе модели Gemini недоступны, пробую Groq (%s)", groq_client.MODEL)
+            return _classify_relation_groq(groq_api_key, prompt)
 
 
 def group_claim(conn, client: genai.Client, claim: dict, event_id: str) -> str:
