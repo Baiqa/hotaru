@@ -1,8 +1,9 @@
 import logging
 
+from google.genai import errors as genai_errors
 from psycopg import OperationalError
 
-from . import config, db, embeddings
+from . import config, db, embeddings, quota
 
 logger = logging.getLogger("hotaru_worker.embed_articles")
 
@@ -26,11 +27,24 @@ def run_once() -> dict:
                 batch = db.articles_missing_embedding(conn, BATCH_SIZE)
                 if not batch:
                     break
+                quota_exhausted = False
                 for article in batch:
                     text = embeddings.article_text(article)
-                    vector = embeddings.embed_text(client, text)
+                    try:
+                        vector = embeddings.embed_text(client, text)
+                    except genai_errors.APIError as exc:
+                        if not quota.is_daily_quota(exc):
+                            raise
+                        # Дневная квота эмбеддингов исчерпана: это не сбой, а
+                        # ожидание сброса — завершаем шаг штатно (не красим job),
+                        # остаток подберёт следующий запуск.
+                        logger.warning("дневная квота эмбеддингов исчерпана, завершаю прогон")
+                        quota_exhausted = True
+                        break
                     db.update_embedding(conn, article["id"], vector)
                     stats["processed"] += 1
+                if quota_exhausted:
+                    break
             consecutive_failures = 0
         except OperationalError:
             consecutive_failures += 1

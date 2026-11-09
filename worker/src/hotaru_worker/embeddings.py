@@ -5,6 +5,8 @@ import httpx
 from google import genai
 from google.genai import errors, types
 
+from . import quota
+
 logger = logging.getLogger(__name__)
 
 MODEL = "gemini-embedding-2"
@@ -41,6 +43,10 @@ def embed_text(client: genai.Client, text: str) -> list[float]:
             )
             return result.embeddings[0].values
         except errors.APIError as exc:
+            if quota.is_daily_quota(exc):
+                # Дневной лимит эмбеддингов (1000/сутки free-tier): повторы
+                # бессмысленны (retryDelay — часы), 75 с backoff впустую (2026-11-09).
+                raise
             # 429 — либо дневная квота (долгий retryDelay, без смысла ждать 5-80с и
             # лучше сразу упасть и остановить прогон), либо короткий rate limit; 5xx —
             # временная перегрузка free-tier модели (сага 2026-10-26). Оба стоит
