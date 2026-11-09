@@ -95,6 +95,11 @@ def _parse_synthesis_json(raw: str) -> _SynthesisResponse:
     data = json.loads(raw)
     if isinstance(data, list):
         data = {"sentences": data}
+    elif isinstance(data, dict) and "sentences" not in data and "text" in data:
+        # Groq без схемной привязки иногда возвращает одно предложение вовсе
+        # без обёртки — ни список, ни {"sentences": [...]} (реальный краш,
+        # 2026-11-09: pydantic ValidationError "sentences: Field required").
+        data = {"sentences": [data]}
     return _SynthesisResponse.model_validate(data)
 
 

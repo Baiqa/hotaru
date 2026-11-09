@@ -58,7 +58,12 @@ def run_once() -> dict:
                 for claim in batch:
                     try:
                         outcome = claim_grouping.group_claim(conn, client, claim, claim["event_id"])
-                    except (genai_errors.APIError, httpx.TransportError, httpx.HTTPStatusError) as exc:
+                    except (genai_errors.APIError, httpx.TransportError, httpx.HTTPStatusError, ValueError, KeyError) as exc:
+                        # ValueError/KeyError — Groq без схемной привязки может
+                        # вернуть JSON без ключа "relation" или с посторонним
+                        # значением (synthesis.py поймал аналогичный краш на
+                        # synthesize, 2026-11-09) — трактуем как обычный сбой,
+                        # не квоту.
                         # Смоук-тест перед батчем (выше) ловит только "квота уже
                         # мёртва на старте" — если она умирает СЕРЕДИНЕ батча,
                         # каждый claim по-прежнему жжёт свой полный retry-бюджет

@@ -51,7 +51,12 @@ def run_once() -> dict:
                     for format in FORMATS:
                         try:
                             result = synthesis.generate_render(client, event["id"], facts, format)
-                        except (genai_errors.APIError, httpx.TransportError, httpx.HTTPStatusError) as exc:
+                        except (genai_errors.APIError, httpx.TransportError, httpx.HTTPStatusError, ValueError, KeyError) as exc:
+                            # ValueError/KeyError — Groq без схемной привязки может
+                            # вернуть JSON, не проходящий даже терпимый парсинг
+                            # synthesis._parse_synthesis_json (pydantic ValidationError
+                            # — подкласс ValueError — крашнула весь процесс, 2026-11-09).
+                            # Трактуем как обычный сбой этого события, не квоту.
                             # Тот же урок, что в group_claims.py (2026-11-06):
                             # смоук-тест перед батчем не ловит квоту, умирающую
                             # СЕРЕДИНЕ батча — generate_render сам внутри уже
