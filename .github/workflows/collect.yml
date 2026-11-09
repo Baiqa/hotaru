@@ -24,6 +24,7 @@ jobs:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
     defaults:
       run:
         working-directory: worker
@@ -33,18 +34,26 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: worker/uv.lock
-      - run: uv sync --frozen
+      # uv sync иногда падает на скачивании (8 ноября: 3 из ~15 запусков) — три попытки.
+      - name: Install dependencies
+        id: deps
+        run: |
+          for attempt in 1 2 3; do
+            uv sync --frozen && exit 0
+            echo "uv sync не удался (попытка $attempt/3)"; sleep 20
+          done
+          exit 1
 
       # Каждый следующий шаг идемпотентен и подбирает необработанное, поэтому
       # сбой одного шага не должен блокировать остальные (job всё равно станет красным).
       - name: Collect RSS
         run: uv run --frozen hotaru-collect
       - name: Extract entities
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: uv run --frozen hotaru-extract-entities
       - name: Embed articles
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: uv run --frozen hotaru-embed-articles
       - name: Cluster events
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: uv run --frozen hotaru-cluster-events

@@ -157,6 +157,35 @@ def add_alias(conn, entity_id: str, alias: str, lang: str) -> None:
         )
 
 
+def load_alias_index(conn) -> list[dict]:
+    """Все алиасы разом (alias, lang, entity_id, type) — для кэша в entities.py.
+    Вместо запроса на каждое упоминание (find_entity_by_alias/list_aliases)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select ea.alias, ea.lang, ea.entity_id, e.type
+            from entity_aliases ea
+            join entities e on e.id = ea.entity_id
+            """
+        )
+        return cur.fetchall()
+
+
+def upsert_article_entities(conn, article_id: str, counts: dict[str, int]) -> None:
+    """Все сущности статьи одним батчем (вместо запроса на каждую)."""
+    if not counts:
+        return
+    with conn.cursor() as cur:
+        cur.executemany(
+            """
+            insert into article_entities (article_id, entity_id, mention_count)
+            values (%s, %s, %s)
+            on conflict (article_id, entity_id) do update set mention_count = excluded.mention_count
+            """,
+            [(article_id, entity_id, count) for entity_id, count in counts.items()],
+        )
+
+
 def upsert_article_entity(conn, article_id: str, entity_id: str, mention_count: int) -> None:
     with conn.cursor() as cur:
         cur.execute(

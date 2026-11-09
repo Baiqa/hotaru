@@ -6,7 +6,7 @@ from google.genai import errors as genai_errors
 from google.genai import types
 from psycopg import OperationalError
 
-from . import claim_extraction, config, db
+from . import claim_extraction, config, db, quota
 
 logger = logging.getLogger("hotaru_worker.extract_claims")
 
@@ -33,18 +33,26 @@ def run_once() -> dict:
                 if not batch:
                     break
                 made_progress = False
+                quota_exhausted = False
                 for article in batch:
                     try:
                         claims = claim_extraction.extract_claims(client, article)
                     except (genai_errors.APIError, httpx.TransportError) as exc:
                         logger.warning("Gemini недоступна для статьи %s (%s), пропускаю", article["id"], exc)
                         stats["skipped_llm_unavailable"] += 1
+                        if quota.is_daily_quota(exc):
+                            # Дневная квота обеих моделей — остальные статьи
+                            # получат то же самое, завершаем прогон (2026-11-09).
+                            quota_exhausted = True
+                            break
                         continue
                     db.insert_claims(conn, article["id"], claims)
                     db.mark_claims_extracted(conn, article["id"])
                     stats["processed"] += 1
                     stats["claims_found"] += len(claims)
                     made_progress = True
+                if quota_exhausted:
+                    break
                 if not made_progress:
                     # Весь батч пропущен (квота/перегрузка Gemini): пропущенные статьи
                     # остаются в articles_missing_claims, и без этого выхода внешний

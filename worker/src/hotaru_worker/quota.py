@@ -23,6 +23,17 @@ def gemini_dead_this_run() -> bool:
     return _gemini_dead_this_run
 
 
+def is_daily_quota(exc: Exception) -> bool:
+    """429 из-за ДНЕВНОГО лимита free-tier (quotaId ...PerDay..., retryDelay в
+    часах): повтор через секунды/минуты бессмыслен, ждать нужно до сброса квоты.
+    Минутный лимит (PerMinute) сюда не попадает — его retry с backoff лечит.
+    Замер 2026-11-09: текст ответа содержит GenerateRequestsPerDayPerProjectPerModel."""
+    if not (isinstance(exc, errors.APIError) and exc.code == 429):
+        return False
+    text = str(exc)
+    return "PerDay" in text or "per day" in text.lower()
+
+
 def has_quota(client: genai.Client, model: str) -> bool:
     """Дешёвая проверка перед батчем. Free-tier — 500 generate_content/день
     (память проекта); без неё каждый claim/событие после исчерпания квоты

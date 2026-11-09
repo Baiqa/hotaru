@@ -104,29 +104,73 @@ def extract_mentions(nlp, text: str, lang: str) -> list[tuple[str, str]]:
     return mentions
 
 
+class _AliasCache:
+    """Кэш алиасов на время процесса. Раньше каждое упоминание шло в БД
+    (find_entity_by_alias ≈0.11 с), а при промахе list_aliases скачивал весь
+    список заново (≈0.7 с на ~6000 строк) — ~6–12 с на статью при ~0.35 с
+    самого spaCy (замер 2026-11-09). Теперь индекс грузится один раз и
+    пополняется при add_alias/create_entity; результат сопоставления тот же
+    (точное совпадение без учёта регистра по языку, затем WRatio >= порога по
+    алиасам того же языка и типа)."""
+
+    def __init__(self, rows: list[dict]):
+        self.exact: dict[tuple[str, str], str] = {}
+        self.fuzzy: dict[tuple[str, str], tuple[list[str], list[str]]] = {}
+        for row in rows:
+            self.add(row["entity_id"], row["alias"], row["lang"], row["type"])
+
+    def add(self, entity_id: str, alias: str, lang: str, entity_type: str) -> None:
+        self.exact.setdefault((lang, alias.lower()), entity_id)
+        aliases, ids = self.fuzzy.setdefault((lang, entity_type), ([], []))
+        aliases.append(alias)
+        ids.append(entity_id)
+
+
+_cache: _AliasCache | None = None
+# Самая короткая форма имени person, уже записанная в этом процессе: повторный
+# UPDATE с не более короткой формой в БД ничего бы не изменил.
+_shortest_person_name: dict[str, int] = {}
+
+
+def _get_cache(conn) -> _AliasCache:
+    global _cache
+    if _cache is None:
+        _cache = _AliasCache(db.load_alias_index(conn))
+    return _cache
+
+
+def reset_cache() -> None:
+    global _cache
+    _cache = None
+    _shortest_person_name.clear()
+
+
 def resolve_entity(conn, canonical_name: str, lang: str, entity_type: str) -> str:
-    existing = db.find_entity_by_alias(conn, canonical_name, lang)
+    cache = _get_cache(conn)
+    existing = cache.exact.get((lang, canonical_name.lower()))
     if existing:
         _maybe_fix_person_canonical_name(conn, existing, canonical_name, entity_type)
         return existing
 
-    candidates = db.list_aliases(conn, lang, entity_type)
-    if candidates:
+    aliases, ids = cache.fuzzy.get((lang, entity_type), ([], []))
+    if aliases:
         match = process.extractOne(
             canonical_name,
-            [c["alias"] for c in candidates],
+            aliases,
             scorer=fuzz.WRatio,
             score_cutoff=FUZZY_MATCH_THRESHOLD,
         )
         if match:
             _, _, idx = match
-            entity_id = candidates[idx]["entity_id"]
+            entity_id = ids[idx]
             db.add_alias(conn, entity_id, canonical_name, lang)
+            cache.add(entity_id, canonical_name, lang, entity_type)
             _maybe_fix_person_canonical_name(conn, entity_id, canonical_name, entity_type)
             return entity_id
 
     entity_id = db.create_entity(conn, canonical_name, entity_type)
     db.add_alias(conn, entity_id, canonical_name, lang)
+    cache.add(entity_id, canonical_name, lang, entity_type)
     return entity_id
 
 
@@ -137,7 +181,11 @@ def _maybe_fix_person_canonical_name(conn, entity_id: str, candidate_name: str, 
     в русском почти всегда ДОБАВЛЯЮТ буквы к именительной форме, поэтому более
     короткий вариант того же алиаса — надёжный сигнал, что он ближе к именительному."""
     if entity_type == "person":
+        seen = _shortest_person_name.get(entity_id)
+        if seen is not None and len(candidate_name) >= seen:
+            return
         db.shorten_canonical_name_if_needed(conn, entity_id, candidate_name)
+        _shortest_person_name[entity_id] = len(candidate_name)
 
 
 def process_article(conn, models: dict, article: dict) -> int:
@@ -150,13 +198,17 @@ def process_article(conn, models: dict, article: dict) -> int:
     text = "\n".join(part for part in (article["title"], article["lead"], article["body"]) if part)
     mentions = extract_mentions(nlp, text, lang)
 
-    counts: dict[str, int] = {}
-    for canonical_name, entity_type in mentions:
-        entity_id = resolve_entity(conn, canonical_name, lang, entity_type)
-        counts[entity_id] = counts.get(entity_id, 0) + 1
+    # Одно и то же (имя, тип) в статье встречается много раз — разбираем один раз.
+    mention_counts: dict[tuple[str, str], int] = {}
+    for mention in mentions:
+        mention_counts[mention] = mention_counts.get(mention, 0) + 1
 
-    for entity_id, count in counts.items():
-        db.upsert_article_entity(conn, article["id"], entity_id, count)
+    counts: dict[str, int] = {}
+    for (canonical_name, entity_type), n in mention_counts.items():
+        entity_id = resolve_entity(conn, canonical_name, lang, entity_type)
+        counts[entity_id] = counts.get(entity_id, 0) + n
+
+    db.upsert_article_entities(conn, article["id"], counts)
 
     db.mark_entities_extracted(conn, article["id"])
     return len(counts)

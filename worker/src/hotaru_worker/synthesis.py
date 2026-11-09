@@ -117,6 +117,8 @@ def _call_model_once(client: genai.Client, model: str, prompt: str) -> _Synthesi
             )
             return _parse_synthesis_json(result.text)
         except errors.APIError as exc:
+            if quota.is_daily_quota(exc):
+                raise
             transient = exc.code == 429 or exc.code >= 500
             if not transient or attempt == MAX_RETRIES - 1:
                 raise

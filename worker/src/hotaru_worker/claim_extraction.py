@@ -8,6 +8,8 @@ from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel
 
+from . import quota
+
 logger = logging.getLogger(__name__)
 
 # Та же модель, что в gray_zone.py — дешёвая, retry/backoff уже отлажен под неё
@@ -77,6 +79,8 @@ def _call_model(client: genai.Client, model: str, prompt: str) -> ClaimsResponse
             )
             return result.parsed
         except errors.APIError as exc:
+            if quota.is_daily_quota(exc):
+                raise
             transient = exc.code == 429 or exc.code >= 500
             if not transient or attempt == MAX_RETRIES - 1:
                 raise

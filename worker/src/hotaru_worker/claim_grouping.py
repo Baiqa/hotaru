@@ -65,6 +65,8 @@ def _call_model(client: genai.Client, model: str, prompt: str) -> Relation:
                 logger.warning("нераспознанный ответ LLM классификации claims: %r, считаю different", result.text)
                 return Relation.DIFFERENT
         except errors.APIError as exc:
+            if quota.is_daily_quota(exc):
+                raise
             transient = exc.code == 429 or exc.code >= 500
             if not transient or attempt == MAX_RETRIES - 1:
                 raise

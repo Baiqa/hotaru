@@ -6,7 +6,7 @@ from google.genai import errors as genai_errors
 from google.genai import types
 from psycopg import OperationalError
 
-from . import clustering, config, db
+from . import clustering, config, db, gray_zone
 
 logger = logging.getLogger("hotaru_worker.cluster_events")
 
@@ -35,6 +35,7 @@ def run_once() -> dict:
                 if not batch:
                     break
                 made_progress = False
+                quota_exhausted = False
                 for article in batch:
                     # Батч выбран один раз в начале итерации — пока обрабатывается
                     # более ранняя статья, самовосстановление в clustering.py
@@ -47,7 +48,15 @@ def run_once() -> dict:
                         continue
                     try:
                         _, created = clustering.cluster_article(conn, client, article)
-                    except (genai_errors.APIError, httpx.TransportError) as exc:
+                    except gray_zone.DailyQuotaExceeded as exc:
+                        # Дневная квота кончилась у всех провайдеров: повторы
+                        # бессмысленны (замер 2026-11-09: 70 минут впустую на
+                        # 210 статей). Статьи остаются в articles_missing_event.
+                        logger.warning("дневная квота LLM исчерпана (%s), завершаю прогон", exc)
+                        stats["skipped_llm_unavailable"] += 1
+                        quota_exhausted = True
+                        break
+                    except (genai_errors.APIError, httpx.TransportError, httpx.HTTPStatusError) as exc:
                         # Gemini недоступна даже после всех retry внутри gray_zone.classify()
                         # (реальный случай 2026-09-27/28 — устойчивая перегрузка free-tier
                         # моделей, плюс отдельно сетевые обрывы вроде httpx.ReadError).
@@ -59,6 +68,8 @@ def run_once() -> dict:
                     stats["processed"] += 1
                     stats["new_events" if created else "joined"] += 1
                     made_progress = True
+                if quota_exhausted:
+                    break
                 if not made_progress:
                     # Весь батч пропущен (квота/перегрузка Gemini): пропущенные статьи
                     # остаются в articles_missing_event, и без этого выхода внешний
