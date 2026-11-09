@@ -35,7 +35,7 @@ class DailyQuotaExceeded(Exception):
 # Groq free-tier кроме дневного лимита имеет минутный: короткую паузу из
 # Retry-After пережидаем, длинную считаем дневной квотой.
 _GROQ_MAX_WAIT_SECONDS = 60
-_GROQ_ATTEMPTS = 3
+_GROQ_ATTEMPTS = 30
 
 
 class Verdict(enum.Enum):
@@ -138,8 +138,15 @@ def _classify_groq(api_key: str, prompt: str) -> Verdict:
                 wait = float(exc.response.headers.get("retry-after", "inf"))
             except ValueError:
                 wait = float("inf")
-            if wait > _GROQ_MAX_WAIT_SECONDS or attempt == _GROQ_ATTEMPTS - 1:
+            if wait > _GROQ_MAX_WAIT_SECONDS:
+                # Длинный Retry-After — дневной лимит. Короткий — минутный: при
+                # непрерывной нагрузке он срабатывает подряд (живой прогон
+                # 2026-11-09: три 429 подряд ошибочно остановили всю кластеризацию),
+                # поэтому ждём и повторяем, а после _GROQ_ATTEMPTS — отдаём ошибку
+                # вызывающему коду (он пропустит статью, но не остановит прогон).
                 raise DailyQuotaExceeded("лимит Groq исчерпан (Retry-After=%s)" % wait) from exc
+            if attempt == _GROQ_ATTEMPTS - 1:
+                raise
             logger.warning("Groq 429, жду %sс (попытка %s/%s)", wait, attempt + 1, _GROQ_ATTEMPTS)
             time.sleep(wait)
     try:

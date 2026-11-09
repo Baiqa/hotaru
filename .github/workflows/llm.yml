@@ -18,7 +18,7 @@ concurrency:
 jobs:
   llm:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
