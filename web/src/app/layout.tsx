@@ -1,6 +1,7 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import Link from "next/link";
+import { PwaClient } from "@/components/PwaClient";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -16,6 +17,15 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "Hotaru",
   description: "Новости как структура: факты с атрибуцией, а не пересказ статей.",
+  appleWebApp: { capable: true, title: "Hotaru", statusBarStyle: "default" },
+};
+
+export const viewport: Viewport = {
+  viewportFit: "cover",
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#0a0a0a" },
+  ],
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
@@ -33,6 +43,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
           </div>
         </header>
         {children}
+        <PwaClient />
       </body>
     </html>
   );
