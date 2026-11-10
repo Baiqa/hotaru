@@ -18,6 +18,13 @@ logger = logging.getLogger(__name__)
 # 503 почти 2 часа подряд, стабильная отвечает нормально. Вернулись на стабильную; если
 # она снова начнёт 503-ить пачками — это известный паттерн у Google, не баг в коде.
 MODEL = "gemini-3.1-flash-lite"
+# Третий уровень цепочки серой зоны (2026-11-10): gemini-3.5-flash-lite. Сверка на 45
+# парах: согласие с кешем основной модели 76%, 0 ложных same из 30, но 7 из 15 same
+# уходят в related. Квота у неё, по предположению, отдельная от основной (дневной лимит
+# не измерен — выяснится по первому дневному 429). Квота gemini-3.1-flash-lite-preview
+# общая с основной, поэтому она НЕ годится как отдельный уровень.
+EXTRA_MODEL = "gemini-3.5-flash-lite"
+_GROQ_NAME = "groq"
 MAX_RETRIES = 8
 INITIAL_BACKOFF_SECONDS = 5
 MAX_BACKOFF_SECONDS = 120
@@ -60,31 +67,58 @@ def classify(client: genai.Client, article_a: dict, article_b: dict) -> Verdict:
     )
 
     groq_api_key = os.environ.get("GROQ_API_KEY")
+    last_exc: Exception | None = None
 
-    # Gemini уже признан мёртвым в этом прогоне — не жжём на нём retry-бюджет.
-    if groq_api_key and quota.gemini_dead_this_run():
-        return _classify_groq(groq_api_key, prompt)
+    # Уровень 1: основная Gemini (пропускаем, если уже признана мёртвой в этом прогоне —
+    # не жжём на ней retry-бюджет).
+    if not quota.gemini_dead_this_run():
+        try:
+            return _classify_gemini(client, prompt, MODEL)
+        except (errors.APIError, httpx.TransportError) as exc:
+            if quota.is_daily_quota(exc):
+                quota.mark_gemini_dead()
+            logger.warning("Gemini недоступна для серой зоны (%s), иду по цепочке дальше", type(exc).__name__)
+            last_exc = exc
 
-    try:
-        return _classify_gemini(client, prompt)
-    except (errors.APIError, httpx.TransportError) as exc:
-        daily = quota.is_daily_quota(exc)
-        if daily:
-            quota.mark_gemini_dead()
-        if not groq_api_key:
-            if daily:
-                raise DailyQuotaExceeded("дневная квота Gemini исчерпана, Groq не настроен") from exc
-            raise
-        logger.warning("Gemini недоступна для серой зоны (%s), пробую Groq (%s)", type(exc).__name__, groq_client.MODEL)
-        return _classify_groq(groq_api_key, prompt)
+    # Уровень 2: Groq (если настроен).
+    if groq_api_key and not quota.is_dead(_GROQ_NAME):
+        try:
+            return _classify_groq(groq_api_key, prompt)
+        except DailyQuotaExceeded as exc:
+            quota.mark_dead(_GROQ_NAME)
+            logger.warning("Groq: дневной лимит исчерпан, иду по цепочке дальше")
+            last_exc = exc
+        except httpx.HTTPError as exc:  # HTTPStatusError (не-429 / исчерпанные повторы), TransportError
+            logger.warning("Groq недоступен для серой зоны (%s), иду по цепочке дальше", type(exc).__name__)
+            last_exc = exc
+
+    # Уровень 3: вторая Gemini-модель с отдельной (предположительно) квотой.
+    if not quota.is_dead(EXTRA_MODEL):
+        try:
+            return _classify_gemini(client, prompt, EXTRA_MODEL)
+        except (errors.APIError, httpx.TransportError) as exc:
+            if quota.is_daily_quota(exc):
+                quota.mark_dead(EXTRA_MODEL)
+                logger.warning("%s: дневная квота исчерпана", EXTRA_MODEL)
+            last_exc = exc
+
+    all_daily = (
+        quota.gemini_dead_this_run()
+        and (not groq_api_key or quota.is_dead(_GROQ_NAME))
+        and quota.is_dead(EXTRA_MODEL)
+    )
+    if all_daily:
+        raise DailyQuotaExceeded("дневные квоты всех провайдеров серой зоны исчерпаны") from last_exc
+    assert last_exc is not None
+    raise last_exc
 
 
-def _classify_gemini(client: genai.Client, prompt: str) -> Verdict:
+def _classify_gemini(client: genai.Client, prompt: str, model: str) -> Verdict:
     backoff = INITIAL_BACKOFF_SECONDS
     for attempt in range(MAX_RETRIES):
         try:
             result = client.models.generate_content(
-                model=MODEL,
+                model=model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="text/x.enum",

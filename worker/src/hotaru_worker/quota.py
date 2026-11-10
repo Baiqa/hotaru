@@ -15,6 +15,11 @@ logger = logging.getLogger("hotaru_worker.quota")
 # переживает рестарт процесса, что и нужно — вдруг квота обновится).
 _gemini_dead_this_run = False
 
+# Те же «мёртвые в этом прогоне» флаги, но по имени провайдера/модели: серая зона
+# ходит по цепочке Gemini → Groq → доп. Gemini-модель (2026-11-10), и у каждого
+# звена своя дневная квота.
+_dead_providers: set[str] = set()
+
 
 def mark_gemini_dead() -> None:
     global _gemini_dead_this_run
@@ -23,6 +28,14 @@ def mark_gemini_dead() -> None:
 
 def gemini_dead_this_run() -> bool:
     return _gemini_dead_this_run
+
+
+def mark_dead(name: str) -> None:
+    _dead_providers.add(name)
+
+
+def is_dead(name: str) -> bool:
+    return name in _dead_providers
 
 
 def is_daily_quota(exc: Exception) -> bool:
