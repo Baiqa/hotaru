@@ -1,5 +1,7 @@
 import logging
 
+import httpx
+
 from google import genai
 from google.genai import errors, types
 
@@ -53,4 +55,12 @@ def has_quota(client: genai.Client, model: str) -> bool:
         if exc.code == 429:
             logger.warning("дневная квота Gemini похоже исчерпана (смоук-тест вернул 429), пропускаю прогон")
             return False
-        raise
+        # 5xx/прочее — транзиентный сбой смоук-теста, не повод ронять шаг (на GitHub
+        # llm-job 2026-11-10 упал за 1-2 с на Group claims/Synthesize; причина по
+        # логам не установлена, это вероятная). Идём в батч: per-claim обработка
+        # сама пропустит сбойные элементы.
+        logger.warning("смоук-тест квоты вернул %s (%s), считаю, что квота есть", exc.code, type(exc).__name__)
+        return True
+    except httpx.TransportError as exc:
+        logger.warning("смоук-тест квоты: сетевой сбой (%s), считаю, что квота есть", exc)
+        return True

@@ -77,7 +77,7 @@ def check_text_length_drop(conn, window_hours: int = 24) -> list[dict]:
     for row in rows:
         if not row["recent_count"] or not row["baseline_count"]:
             status = "no_data"
-        elif row["recent_avg"] < row["baseline_avg"] * TEXT_LENGTH_DROP_RATIO:
+        elif float(row["recent_avg"]) < float(row["baseline_avg"]) * TEXT_LENGTH_DROP_RATIO:
             status = "alert"
         else:
             status = "ok"
