@@ -26,6 +26,12 @@ MAX_RETRIES = 4
 INITIAL_BACKOFF_SECONDS = 5
 MAX_BACKOFF_SECONDS = 60
 
+# Раздел 3.1 CLAUDE.md: "цитаты не длиннее одного предложения". evidence показывается
+# пользователю дословно, поэтому длинная выдержка — это уже воспроизведение чужого
+# текста. Аудит 2026-11-11: у 56 из 9523 claims evidence был длиннее 300 символов
+# (при среднем 112). Такой claim отбрасывается целиком, как и claim без evidence.
+MAX_EVIDENCE_CHARS = 300
+
 _PROMPT_PATH = Path(__file__).resolve().parents[3] / "prompts" / "extract_claims.txt"
 _PROMPT_TEMPLATE = _PROMPT_PATH.read_text(encoding="utf-8")
 
@@ -60,6 +66,10 @@ def _verify_evidence(article_text: str, evidence: str) -> bool:
     if not evidence:
         return False
     return _normalize_whitespace(evidence) in _normalize_whitespace(article_text)
+
+
+def _evidence_too_long(evidence: str) -> bool:
+    return len(_normalize_whitespace(evidence)) > MAX_EVIDENCE_CHARS
 
 
 def _call_model(client: genai.Client, model: str, prompt: str) -> ClaimsResponse | None:
@@ -131,6 +141,11 @@ def extract_claims(client: genai.Client, article: dict) -> list[dict]:
     for claim in parsed.claims:
         if not _verify_evidence(full_text, claim.evidence):
             logger.info("claim отброшен — evidence не найден в тексте: %r", claim.evidence[:80])
+            continue
+        if _evidence_too_long(claim.evidence):
+            logger.info(
+                "claim отброшен — evidence длиннее %s символов: %r", MAX_EVIDENCE_CHARS, claim.evidence[:80]
+            )
             continue
         verified.append(
             {

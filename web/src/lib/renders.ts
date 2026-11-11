@@ -1,4 +1,5 @@
 import { resolveActiveEventId } from "./events";
+import { clampQuote } from "./quote";
 import { supabase } from "./supabase";
 
 export type ClaimBucket = "confirmed" | "unique" | "disputed";
@@ -71,7 +72,7 @@ function toCitedClaim(claim: ClaimRow): CitedClaim | null {
 
   return {
     claimId: claim.id,
-    evidence: claim.evidence,
+    evidence: clampQuote(claim.evidence),
     sourceName: source.name,
     sourceUrl: article.canonical_url,
     bucket: group?.bucket ?? null,

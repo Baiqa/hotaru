@@ -1,4 +1,5 @@
 import { resolveActiveEventId } from "./events";
+import { clampQuote } from "./quote";
 import { supabase } from "./supabase";
 
 export type ClaimBucket = "confirmed" | "unique" | "disputed";
@@ -60,7 +61,7 @@ function toFact(group: ClaimGroupRow): ComparisonFact | null {
       sourceName: source.name,
       sourceUrl: article.canonical_url,
       text: claim.text,
-      evidence: claim.evidence,
+      evidence: clampQuote(claim.evidence),
     });
 
     if (!earliest || m.joined_at < earliest.joinedAt) {
