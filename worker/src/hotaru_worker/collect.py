@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import feedparser
 
-from . import config, db, extract, normalize
+from . import config, db, extract, normalize, runlog
 from .politeness import PoliteClient
 
 logger = logging.getLogger("hotaru_worker.collect")
@@ -132,8 +132,10 @@ def run_once() -> dict:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    run_once()
+    # Мягкого бюджета времени внутри сбора нет намеренно: источники идут в
+    # фиксированном порядке, и обрезка по времени каждый раз отбрасывала бы один
+    # и тот же хвост списка (РИА, ТАСС, Интерфакс).
+    runlog.run("collect", run_once)
 
 
 if __name__ == "__main__":

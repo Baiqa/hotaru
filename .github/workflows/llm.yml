@@ -3,16 +3,18 @@ name: llm
 # Факты, группировка и синтез текста. Делят дневную квоту Gemini (free tier),
 # поэтому идут одной цепочкой и раз в час; при исчерпанной квоте шаги
 # завершаются за секунды (quota.has_quota / выход при батче без прогресса).
+# С 2026-11-12 расписание отключено: шаги этого файла выполняет единый
+# .github/workflows/pipeline.yml. Файл оставлен только для ручного запуска как
+# запасной вариант на время проверки нового конвейера; после суток стабильной
+# работы pipeline.yml его нужно удалить (фаза 2 плана P0).
 on:
-  schedule:
-    - cron: "10 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: hotaru-llm
+  group: hotaru-pipeline
   cancel-in-progress: false
 
 jobs:

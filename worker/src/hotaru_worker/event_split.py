@@ -1,6 +1,6 @@
 import logging
 
-from . import db
+from . import config, db, runlog
 
 logger = logging.getLogger("hotaru_worker.event_split")
 
@@ -90,6 +90,8 @@ def run_once(conn) -> dict:
     events = db.list_active_events(conn)
     stats = {"checked": 0, "split": 0}
     for event in events:
+        if runlog.out_of_time():
+            break
         if event["article_count"] < MIN_EVENT_SIZE_TO_CHECK:
             continue
         stats["checked"] += 1
@@ -100,13 +102,14 @@ def run_once(conn) -> dict:
     return stats
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    from . import config
-
+def _run() -> dict:
     cfg = config.load()
     with db.connect(cfg.database_url) as conn:
-        run_once(conn)
+        return run_once(conn)
+
+
+def main() -> None:
+    runlog.run("split-events", _run)
 
 
 if __name__ == "__main__":

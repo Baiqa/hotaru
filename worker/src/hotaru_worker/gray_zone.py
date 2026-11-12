@@ -9,7 +9,7 @@ import httpx
 from google import genai
 from google.genai import errors, types
 
-from . import groq_client, quota
+from . import groq_client, quota, runlog
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +134,10 @@ def _classify_gemini(client: genai.Client, prompt: str, model: str) -> Verdict:
             if quota.is_daily_quota(exc):
                 raise
             transient = exc.code == 429 or exc.code >= 500
-            if not transient or attempt == MAX_RETRIES - 1:
+            # runlog.out_of_time(): бюджет времени шага исчерпан — не уходим в
+            # очередное ожидание (суммарно до ~6,5 мин на пару), отдаём ошибку
+            # вызывающему коду, он пропустит статью до следующего запуска.
+            if not transient or attempt == MAX_RETRIES - 1 or runlog.out_of_time():
                 raise
             logger.warning(
                 "Gemini API %s, жду %sс (попытка %s/%s)", exc.code, backoff, attempt + 1, MAX_RETRIES
@@ -179,7 +182,9 @@ def _classify_groq(api_key: str, prompt: str) -> Verdict:
                 # поэтому ждём и повторяем, а после _GROQ_ATTEMPTS — отдаём ошибку
                 # вызывающему коду (он пропустит статью, но не остановит прогон).
                 raise DailyQuotaExceeded("лимит Groq исчерпан (Retry-After=%s)" % wait) from exc
-            if attempt == _GROQ_ATTEMPTS - 1:
+            # До 30 попыток по до 60 с — до получаса на одну пару; при исчерпанном
+            # бюджете времени шага не ждём, статью подберёт следующий запуск.
+            if attempt == _GROQ_ATTEMPTS - 1 or runlog.out_of_time():
                 raise
             logger.warning("Groq 429, жду %sс (попытка %s/%s)", wait, attempt + 1, _GROQ_ATTEMPTS)
             time.sleep(wait)

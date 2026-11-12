@@ -1,6 +1,6 @@
 import logging
 
-from . import db
+from . import config, db, runlog
 
 logger = logging.getLogger("hotaru_worker.story_assignment")
 
@@ -34,6 +34,8 @@ def run_once(conn) -> dict:
     stats = {"processed": 0, "new_stories": 0, "joined_existing": 0}
 
     for event in events:
+        if runlog.out_of_time():
+            break
         entity_ids = db.event_entity_ids(conn, event["id"])
         story_id = None
         if entity_ids:
@@ -65,13 +67,14 @@ def run_once(conn) -> dict:
     return stats
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    from . import config
-
+def _run() -> dict:
     cfg = config.load()
     with db.connect(cfg.database_url) as conn:
-        run_once(conn)
+        return run_once(conn)
+
+
+def main() -> None:
+    runlog.run("assign-stories", _run)
 
 
 if __name__ == "__main__":

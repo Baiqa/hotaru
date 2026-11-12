@@ -6,7 +6,7 @@ from google.genai import errors as genai_errors
 from google.genai import types
 from psycopg import OperationalError
 
-from . import claim_extraction, config, db, quota
+from . import claim_extraction, config, db, quota, runlog
 
 logger = logging.getLogger("hotaru_worker.extract_claims")
 
@@ -34,7 +34,11 @@ def run_once() -> dict:
                     break
                 made_progress = False
                 quota_exhausted = False
+                time_up = False
                 for article in batch:
+                    if runlog.out_of_time():
+                        time_up = True
+                        break
                     try:
                         claims = claim_extraction.extract_claims(client, article)
                     except (genai_errors.APIError, httpx.TransportError) as exc:
@@ -51,7 +55,7 @@ def run_once() -> dict:
                     stats["processed"] += 1
                     stats["claims_found"] += len(claims)
                     made_progress = True
-                if quota_exhausted:
+                if quota_exhausted or time_up:
                     break
                 if not made_progress:
                     # Весь батч пропущен (квота/перегрузка Gemini): пропущенные статьи
@@ -73,8 +77,7 @@ def run_once() -> dict:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    run_once()
+    runlog.run("extract-claims", run_once)
 
 
 if __name__ == "__main__":

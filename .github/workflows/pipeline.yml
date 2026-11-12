@@ -1,0 +1,119 @@
+name: pipeline
+
+# Единый конвейер воркера (фаза 2 плана P0, tmp/plans/p0-ispravleniya-posle-audita.md).
+# Заменяет четыре отдельных workflow (collect, llm, maintenance-hourly,
+# maintenance-daily): все шаги идут строго по очереди в одном job, поэтому
+# параллельных писателей в БД нет по построению.
+#
+# Время. Раньше job целиком убивался по таймауту на одном медленном шаге (19 из 20
+# отменённых запусков на 2026-11-12), и остальные шаги не выполнялись. Теперь у
+# шага два предела:
+#   --max-minutes N   мягкий: шаг сам заканчивает текущий элемент и выходит
+#                     (worker/src/hotaru_worker/runlog.py), остаток — в следующем запуске;
+#   timeout-minutes   жёсткий, с запасом над мягким: страховка, если шаг завис.
+# Сбой или таймаут одного шага не останавливает следующие (if: !cancelled()).
+#
+# Редкие шаги (--if-due-hours N) сами решают по журналу pipeline_runs, пора ли им
+# запускаться, — отдельного cron для них нет.
+#
+# Только расписание и ручной запуск (никаких pull_request: секреты не должны
+# попадать в код, запускаемый из форков публичного репозитория).
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Один запуск за раз. Пока идёт текущий, новый по расписанию ждёт; более свежий
+# ожидающий заменяет предыдущего ожидающего — это нормально, запуски одинаковые.
+concurrency:
+  group: hotaru-pipeline
+  cancel-in-progress: false
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    # Сумма мягких бюджетов шагов ~150 мин в худшем случае; обычный запуск короче.
+    timeout-minutes: 170
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: worker/uv.lock
+      # uv sync иногда падает на скачивании (8 ноября: 3 из ~15 запусков) — три попытки.
+      - name: Install dependencies
+        id: deps
+        run: |
+          for attempt in 1 2 3; do
+            uv sync --frozen && exit 0
+            echo "uv sync не удался (попытка $attempt/3)"; sleep 20
+          done
+          exit 1
+
+      # --- 1. Сбор и события ---
+      - name: Collect RSS
+        timeout-minutes: 30
+        run: uv run --frozen hotaru-collect
+      - name: Extract entities
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 20
+        run: uv run --frozen hotaru-extract-entities --max-minutes 12
+      - name: Embed articles
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 12
+        run: uv run --frozen hotaru-embed-articles --max-minutes 8
+      - name: Cluster events
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 35
+        run: uv run --frozen hotaru-cluster-events --max-minutes 25
+      - name: Merge events
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 15
+        run: uv run --frozen hotaru-merge-events --max-minutes 10
+      - name: Assign events to stories
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 10
+        run: uv run --frozen hotaru-assign-stories --max-minutes 5
+
+      # --- 2. Факты и тексты (делят дневную квоту LLM) ---
+      - name: Extract claims
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 18
+        run: uv run --frozen hotaru-extract-claims --max-minutes 12
+      - name: Embed claims
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 10
+        run: uv run --frozen hotaru-embed-claims --max-minutes 5
+      - name: Group claims
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 14
+        run: uv run --frozen hotaru-group-claims --max-minutes 8
+      - name: Synthesize event texts
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 18
+        run: uv run --frozen hotaru-synthesize --max-minutes 12
+
+      # --- 3. Редкие шаги: выполняются, только если пришло время ---
+      - name: Split events (раз в сутки)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 12
+        run: uv run --frozen hotaru-split-events --if-due-hours 20 --max-minutes 8
+      - name: Fetch World Bank series (раз в сутки)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 10
+        run: uv run --frozen hotaru-fetch-metrics --if-due-hours 20
+      - name: Pipeline monitoring (раз в 6 часов)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 5
+        run: uv run --frozen hotaru-monitor --if-due-hours 6

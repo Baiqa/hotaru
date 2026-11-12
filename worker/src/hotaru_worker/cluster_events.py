@@ -6,7 +6,7 @@ from google.genai import errors as genai_errors
 from google.genai import types
 from psycopg import OperationalError
 
-from . import clustering, config, db, gray_zone
+from . import clustering, config, db, gray_zone, runlog
 
 logger = logging.getLogger("hotaru_worker.cluster_events")
 
@@ -36,7 +36,11 @@ def run_once() -> dict:
                     break
                 made_progress = False
                 quota_exhausted = False
+                time_up = False
                 for article in batch:
+                    if runlog.out_of_time():
+                        time_up = True
+                        break
                     # Батч выбран один раз в начале итерации — пока обрабатывается
                     # более ранняя статья, самовосстановление в clustering.py
                     # (_resolve_join_event) могло уже создать событие для более
@@ -68,7 +72,7 @@ def run_once() -> dict:
                     stats["processed"] += 1
                     stats["new_events" if created else "joined"] += 1
                     made_progress = True
-                if quota_exhausted:
+                if quota_exhausted or time_up:
                     break
                 if not made_progress:
                     # Весь батч пропущен (квота/перегрузка Gemini): пропущенные статьи
@@ -90,8 +94,7 @@ def run_once() -> dict:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    run_once()
+    runlog.run("cluster-events", run_once)
 
 
 if __name__ == "__main__":

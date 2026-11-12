@@ -2,16 +2,18 @@ name: maintenance-hourly
 
 # Слияние событий (CLAUDE.md §3.3, раз в час) и привязка событий к сюжетам.
 # Gemini не используют.
+# С 2026-11-12 расписание отключено: шаги этого файла выполняет единый
+# .github/workflows/pipeline.yml. Файл оставлен только для ручного запуска как
+# запасной вариант на время проверки нового конвейера; после суток стабильной
+# работы pipeline.yml его нужно удалить (фаза 2 плана P0).
 on:
-  schedule:
-    - cron: "40 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: hotaru-events-writers
+  group: hotaru-pipeline
   cancel-in-progress: false
 
 jobs:

@@ -2,7 +2,7 @@ import logging
 
 from psycopg import OperationalError
 
-from . import config, db, entities
+from . import config, db, entities, runlog
 
 logger = logging.getLogger("hotaru_worker.extract_entities")
 
@@ -26,6 +26,7 @@ def run_once() -> dict:
     # середине ("server closed the connection unexpectedly"). Повтор безопасен:
     # уже обработанные статьи не попадут в следующую выборку (entities_extracted_at).
     consecutive_failures = 0
+    time_up = False
     while True:
         try:
             with db.connect(cfg.database_url) as conn:
@@ -33,11 +34,16 @@ def run_once() -> dict:
                 if not batch:
                     break
                 for article in batch:
+                    if runlog.out_of_time():
+                        time_up = True
+                        break
                     if article["lang"] not in models:
                         stats["skipped_no_model"] += 1
                     found = entities.process_article(conn, models, article)
                     stats["processed"] += 1
                     stats["entities_found"] += found
+                if time_up:
+                    break
             consecutive_failures = 0
         except OperationalError:
             consecutive_failures += 1
@@ -51,8 +57,7 @@ def run_once() -> dict:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    run_once()
+    runlog.run("extract-entities", run_once)
 
 
 if __name__ == "__main__":

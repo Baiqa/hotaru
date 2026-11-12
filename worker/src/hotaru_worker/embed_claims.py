@@ -3,7 +3,7 @@ import logging
 from google.genai import errors as genai_errors
 from psycopg import OperationalError
 
-from . import config, db, embeddings, quota
+from . import config, db, embeddings, quota, runlog
 
 logger = logging.getLogger("hotaru_worker.embed_claims")
 
@@ -26,7 +26,11 @@ def run_once() -> dict:
                 if not batch:
                     break
                 quota_exhausted = False
+                time_up = False
                 for claim in batch:
+                    if runlog.out_of_time():
+                        time_up = True
+                        break
                     try:
                         vector = embeddings.embed_text(client, claim["text"])
                     except genai_errors.APIError as exc:
@@ -39,7 +43,7 @@ def run_once() -> dict:
                         break
                     db.update_claim_embedding(conn, claim["id"], vector)
                     stats["processed"] += 1
-                if quota_exhausted:
+                if quota_exhausted or time_up:
                     break
             consecutive_failures = 0
         except OperationalError:
@@ -54,8 +58,7 @@ def run_once() -> dict:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    run_once()
+    runlog.run("embed-claims", run_once)
 
 
 if __name__ == "__main__":

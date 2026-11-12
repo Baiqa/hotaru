@@ -1,6 +1,6 @@
 import logging
 
-from . import config, db, monitoring
+from . import config, db, monitoring, runlog
 
 logger = logging.getLogger("hotaru_worker.monitor")
 
@@ -50,8 +50,7 @@ def run_once() -> dict:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    run_once()
+    runlog.run("monitor", run_once)
 
 
 if __name__ == "__main__":

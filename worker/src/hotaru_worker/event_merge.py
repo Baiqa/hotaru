@@ -1,6 +1,6 @@
 import logging
 
-from . import db, scoring
+from . import config, db, runlog, scoring
 
 logger = logging.getLogger("hotaru_worker.event_merge")
 
@@ -38,6 +38,8 @@ def run_once(conn) -> dict:
     merged_ids: set[str] = set()
 
     for event in events:
+        if runlog.out_of_time():
+            break
         if event["id"] in merged_ids:
             continue
         entity_ids = db.event_entity_ids(conn, event["id"])
@@ -70,13 +72,14 @@ def run_once(conn) -> dict:
     return stats
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    from . import config
-
+def _run() -> dict:
     cfg = config.load()
     with db.connect(cfg.database_url) as conn:
-        run_once(conn)
+        return run_once(conn)
+
+
+def main() -> None:
+    runlog.run("merge-events", _run)
 
 
 if __name__ == "__main__":

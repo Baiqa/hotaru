@@ -6,7 +6,7 @@ from google.genai import errors as genai_errors
 from google.genai import types
 from psycopg import OperationalError
 
-from . import claim_grouping, config, db, quota
+from . import claim_grouping, config, db, quota, runlog
 
 logger = logging.getLogger("hotaru_worker.group_claims")
 
@@ -49,6 +49,7 @@ def run_once() -> dict:
     # Новое соединение на каждый батч — тот же урок, что в cluster_events.py.
     consecutive_failures = 0
     quota_died_mid_run = False
+    time_up = False
     while True:
         try:
             with db.connect(cfg.database_url) as conn:
@@ -56,6 +57,9 @@ def run_once() -> dict:
                 if not batch:
                     break
                 for claim in batch:
+                    if runlog.out_of_time():
+                        time_up = True
+                        break
                     try:
                         outcome = claim_grouping.group_claim(conn, client, claim, claim["event_id"])
                     except (genai_errors.APIError, httpx.TransportError, httpx.HTTPStatusError, ValueError, KeyError) as exc:
@@ -99,6 +103,8 @@ def run_once() -> dict:
             if quota_died_mid_run:
                 stats["skipped_quota_exhausted"] = True
                 break
+            if time_up:
+                break
         except OperationalError:
             consecutive_failures += 1
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -111,8 +117,7 @@ def run_once() -> dict:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    run_once()
+    runlog.run("group-claims", run_once)
 
 
 if __name__ == "__main__":

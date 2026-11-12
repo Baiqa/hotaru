@@ -4,7 +4,7 @@ import httpx
 from google.genai import errors as genai_errors
 from psycopg import OperationalError
 
-from . import config, db, quota, synthesis
+from . import config, db, quota, runlog, synthesis
 
 logger = logging.getLogger("hotaru_worker.synthesize")
 
@@ -37,6 +37,7 @@ def run_once() -> dict:
     # group_claims.py.
     consecutive_failures = 0
     quota_died_mid_run = False
+    time_up = False
     while True:
         try:
             with db.connect(cfg.database_url) as conn:
@@ -44,6 +45,9 @@ def run_once() -> dict:
                 if not batch:
                     break
                 for event in batch:
+                    if runlog.out_of_time():
+                        time_up = True
+                        break
                     facts = db.event_facts_for_synthesis(conn, event["id"])
                     if not facts:
                         continue
@@ -88,6 +92,8 @@ def run_once() -> dict:
             if quota_died_mid_run:
                 stats["skipped_quota_exhausted"] = True
                 break
+            if time_up:
+                break
         except OperationalError:
             consecutive_failures += 1
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -100,8 +106,7 @@ def run_once() -> dict:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    run_once()
+    runlog.run("synthesize", run_once)
 
 
 if __name__ == "__main__":
