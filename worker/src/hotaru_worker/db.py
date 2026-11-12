@@ -523,6 +523,13 @@ def find_candidate_articles(
 
 
 def list_active_events(conn) -> list[dict]:
+    """Активные события, от самых свежих к старым. Порядок важен с появлением
+    бюджета времени шага (runlog.py): слияние и разделение обходят этот список по
+    очереди и при исчерпании бюджета бросают хвост. Первый же запуск на GitHub
+    (2026-11-12) показал, что слияние не успевает обойти все 2626 событий за 10
+    минут; без сортировки под обрезку каждый раз попадали бы одни и те же события,
+    причём какие именно — зависело бы от физического порядка строк. Свежие события
+    — те, у которых слияния ещё возможны; старые уже много раз проверены."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -530,6 +537,7 @@ def list_active_events(conn) -> list[dict]:
                    (select count(*) from event_articles ea where ea.event_id = e.id) as article_count
             from events e
             where e.status = 'active' and e.centroid is not null
+            order by e.started_at desc, e.id
             """
         )
         return cur.fetchall()
