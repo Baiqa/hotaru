@@ -1,4 +1,6 @@
+import codecs
 import logging
+import re
 import time
 from urllib.parse import urlsplit
 from urllib.robotparser import RobotFileParser
@@ -6,6 +8,29 @@ from urllib.robotparser import RobotFileParser
 import httpx
 
 logger = logging.getLogger(__name__)
+
+_META_CHARSET_RE = re.compile(rb"<meta[^>]+charset\s*=\s*[\"']?\s*([A-Za-z0-9_.:-]+)", re.IGNORECASE)
+
+
+def decode_html(content: bytes) -> str:
+    """Декодирование HTML, когда заголовок Content-Type не называет кодировку.
+
+    httpx в этом случае читает ответ как UTF-8 с заменой нечитаемых байт на «�».
+    Проверено 2026-11-15: sport-interfax.ru отдаёт `Content-Type: text/html` без
+    charset, а кодировку (windows-1251) объявляет только мета-тегом — все 38 его
+    статей в БД с битыми заголовком и текстом. Поэтому сначала ищем мета-тег в
+    начале документа, затем пробуем строгий UTF-8, и только потом — замену.
+    """
+    match = _META_CHARSET_RE.search(content[:4096])
+    if match:
+        try:
+            return content.decode(codecs.lookup(match.group(1).decode("ascii")).name, errors="replace")
+        except LookupError:
+            pass  # неизвестное имя кодировки — как будто мета-тега нет
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError:
+        return content.decode("utf-8", errors="replace")
 
 
 class PoliteClient:
@@ -66,6 +91,8 @@ class PoliteClient:
         if resp.status_code >= 400:
             logger.warning("запрос к %s вернул статус %s", url, resp.status_code)
             return None
+        if resp.charset_encoding is None and "html" in resp.headers.get("content-type", "").lower():
+            return decode_html(resp.content)
         return resp.text
 
     def close(self) -> None:

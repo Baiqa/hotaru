@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import feedparser
 
-from . import config, db, extract, normalize, runlog
+from . import config, dates, db, extract, normalize, runlog
 from .politeness import PoliteClient
 
 logger = logging.getLogger("hotaru_worker.collect")
@@ -29,11 +29,22 @@ def _entry_published_at(entry) -> datetime | None:
     return datetime(*parsed[:6], tzinfo=timezone.utc)
 
 
-def _build_article(entry, canonical_url: str, source_id: str, extracted: dict | None) -> dict | None:
+def _build_article(
+    entry,
+    canonical_url: str,
+    source_id: str,
+    extracted: dict | None,
+    now: datetime | None = None,
+) -> dict | None:
+    now = now or datetime.now(timezone.utc)
     lead = _clean_summary(entry.get("summary"))
+    # Заголовок из ленты — первичный: страница отдаёт его вместе с хвостом сайта
+    # («... | TechCrunch» у 154 из 155 статей) и в неверной кодировке.
+    rss_title = _clean_summary(entry.get("title"))
+    rss_time = _entry_published_at(entry)
 
     if extracted:
-        title = extracted["title"] or _clean_summary(entry.get("title"))
+        title = rss_title or extracted["title"]
         if not title:
             return None
         return {
@@ -43,25 +54,24 @@ def _build_article(entry, canonical_url: str, source_id: str, extracted: dict | 
             "title": title,
             "lead": lead,
             "body": extracted["body"],
-            "published_at": extracted["published_at"] or _entry_published_at(entry),
+            "published_at": dates.choose_published_at(rss_time, extracted["published_at"], now),
             "content_hash": normalize.content_hash(extracted["body"]),
             "fetch_status": "ok",
         }
 
     # Полный текст не получен (robots.txt, ошибка сети, слишком короткий текст) —
     # сохраняем только то, что реально есть в RSS, без выдумывания недостающего.
-    title = _clean_summary(entry.get("title"))
-    if not title or not lead:
+    if not rss_title or not lead:
         return None
 
     return {
         "source_id": source_id,
         "url": entry.get("link"),
         "canonical_url": canonical_url,
-        "title": title,
+        "title": rss_title,
         "lead": lead,
         "body": None,
-        "published_at": _entry_published_at(entry),
+        "published_at": dates.choose_published_at(rss_time, None, now),
         "content_hash": normalize.content_hash(lead),
         "fetch_status": "partial",
     }
