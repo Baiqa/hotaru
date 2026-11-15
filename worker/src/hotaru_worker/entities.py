@@ -1,12 +1,51 @@
 import logging
+import re
 
 import pymorphy3
 import spacy
+import yaml
 from rapidfuzz import fuzz, process
 
-from . import db
+from . import config, db
 
 logger = logging.getLogger(__name__)
+
+# Служебные строки в начале текста: пометка агентства с городом и датой. Они попадают в
+# NER как сущности («МОСКВА» → org, «Риа Новости» → org) и делают общей сущность у трети
+# русскоязычного потока (замер 2026-11-15, окно 7 дней: Москва — 2373 статьи, Риа Новости
+# — 2271 из 6321). Это не содержание статьи, поэтому строка вырезается целиком до NER.
+# Формы проверены по 4874 русскоязычным текстам за 30 дней.
+_SERVICE_LINE_RES = (
+    # РИА Новости: «МОСКВА, 9 ноя - РИА Новости.», также «—», «Sputnik», «, Имя Фамилия.»
+    re.compile(
+        r"^[А-ЯЁ][А-ЯЁ0-9 .,()\-–—/«»]{1,60}?, \d{1,2} [а-яё]{3,8}\.? ?[-–—] "
+        r"(?:РИА Новости|ТАСС|Sputnik)[^.\n]{0,60}\.[ \t]*",
+        re.MULTILINE,
+    ),
+    # Интерфакс: «Москва. 15 ноября. INTERFAX.RU - »
+    re.compile(
+        r"^[А-ЯЁ][А-Яа-яё .\-]{1,40}\. \d{1,2} [а-яё]{3,8}\. INTERFAX\.RU[ \t]*[-–—][ \t]*",
+        re.MULTILINE,
+    ),
+    # ТАСС: «МОСКВА, 15 ноября. /ТАСС/.»
+    re.compile(r"^[А-ЯЁ][А-ЯЁ .\-]{1,40}, \d{1,2} [а-яё]{3,8}\. /ТАСС/\.[ \t]*", re.MULTILINE),
+)
+
+
+def strip_service_lines(text: str) -> str:
+    for pattern in _SERVICE_LINE_RES:
+        text = pattern.sub("", text)
+    return text
+
+
+def _load_publisher_stoplist() -> frozenset[str]:
+    with open(config.PACKAGE_DIR / "entity_stoplist.yaml", "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    return frozenset(_stop_key(name) for name in data["publishers"])
+
+
+def _stop_key(name: str) -> str:
+    return " ".join(name.strip(" \"'«»„“”").lower().split())
 
 # kk-модели у spaCy нет, и kk-источников в sources.yaml тоже пока нет (см. CLAUDE.md §8) —
 # ru/en покрывают весь текущий поток.
@@ -46,15 +85,141 @@ def _titlecase(word: str) -> str:
     return word[:1].upper() + word[1:] if word else word
 
 
+_PUBLISHERS = _load_publisher_stoplist()
+
+_NAME_GRAMMEMES = {"Surn", "Name", "Patr"}
+_SPACY_TO_PYMORPHY_CASE = {"Nom": "nomn", "Gen": "gent", "Dat": "datv", "Acc": "accs", "Ins": "ablt", "Loc": "loct"}
+_SPACY_TO_PYMORPHY_GENDER = {"Masc": "masc", "Fem": "femn"}
+# Падежные окончания мужских фамилий, которых нет в словаре pymorphy («Мерца», «Макрона»,
+# «Уиткоффом»). Отрезаются, только если основа уже известна как имя человека.
+_MASC_CASE_SUFFIXES = {
+    "Gen": ("а", "я"),
+    "Acc": ("а", "я"),
+    "Dat": ("у", "ю"),
+    "Ins": ("ом", "ем", "ым", "им"),
+    "Loc": ("е",),
+}
+
+# Слова, которые уже видели в именительном падеже в составе имени человека. Наполняется по
+# ходу работы (_remember_person_token) и при старте из БД (seed_known_person_tokens).
+_known_person_tokens: set[str] = set()
+
+
+def seed_known_person_tokens(names: list[str]) -> None:
+    for name in names:
+        for part in name.split():
+            if len(part) >= 3 and part[:1].isupper():
+                _known_person_tokens.add(part.lower())
+
+
+def _remember_person_token(text: str) -> None:
+    if len(text) >= 3 and text[:1].isupper() and not text.isupper():
+        _known_person_tokens.add(text.lower())
+
+
+def _has_name_parse(word: str) -> bool:
+    return any(_NAME_GRAMMEMES & set(parse.tag.grammemes) for parse in _morph.parse(word))
+
+
+def _person_tokens(span) -> list:
+    """Токены имени без случайно захваченных слов. spaCy-small иногда включает в PER
+    соседнее слово: «Ответил Мишустин», «Победа Андреевой». Отбрасываем с краёв только
+    глаголы/наречия/предлоги и — с левого края — неодушевлённое существительное, у
+    которого в словаре нет разбора как имя («Победа»)."""
+    tokens = list(span)
+    # Тире, отбитое пробелами («Трамп - республиканцы -»), — конец имени: дальше уже другая
+    # фраза. Дефис внутри имени («Жан-Клод») пробелами не отбит и границей не считается.
+    for i in range(1, len(tokens)):
+        if tokens[i].text in ("-", "–", "—") and tokens[i - 1].whitespace_:
+            tokens = tokens[:i]
+            break
+
+    def is_junk(token, leading: bool) -> bool:
+        if token.pos_ in ("VERB", "AUX", "ADV", "ADP", "PART", "CCONJ", "SCONJ"):
+            return True
+        return (
+            leading
+            and token.pos_ == "NOUN"
+            and "Inan" in token.morph.get("Animacy")
+            and not _has_name_parse(token.text)
+        )
+
+    while len(tokens) > 1 and is_junk(tokens[0], leading=True):
+        tokens.pop(0)
+    while len(tokens) > 1 and is_junk(tokens[-1], leading=False):
+        tokens.pop()
+    return tokens
+
+
+def _nominative_person_token(token, case: str | None, gender: str | None) -> str:
+    """Имя/фамилия/отчество в именительный падеж. Падеж и род берём у spaCy (на «Трампа»
+    он верно даёт Gen/Masc), форму — у pymorphy3 из разбора с граммемой Surn/Name/Patr:
+    без этого «Токаева» лемматизировалось бы в женское имя «Токаева». Именительный падеж
+    не трогаем («Токаев» pymorphy знает как слово «токай»).
+
+    case/gender — не самого токена, а опорного слова всего имени (_normalize_ru_person):
+    полное имя склоняется целиком, а spaCy-small для «flat:name»-токенов даёт собственные,
+    нередко ошибочные значения («Валерия Чекалина»: имя Nom/Fem, фамилия Gen/Masc — и
+    фамилию превращало в «Чекалин»)."""
+    text = token.text
+    if case in (None, "Nom") or case not in _SPACY_TO_PYMORPHY_CASE:
+        _remember_person_token(text)
+        return text
+    if text.isupper() or "-" in text or len(text) < 3 or not text[:1].isupper():
+        return text
+
+    gender = _SPACY_TO_PYMORPHY_GENDER.get(gender)
+    want_case = _SPACY_TO_PYMORPHY_CASE[case]
+    for parse in _morph.parse(text):
+        tag = parse.tag
+        if not (_NAME_GRAMMEMES & set(tag.grammemes)) or tag.number != "sing" or tag.case != want_case:
+            continue
+        # Общий род (ms-f, «Соболенко») pymorphy отдаёт как gender=None.
+        if gender and tag.gender is not None and tag.gender != gender:
+            continue
+        inflected = parse.inflect({"nomn"})
+        if inflected:
+            return _titlecase(inflected.word)
+
+    if gender == "masc":
+        for suffix in _MASC_CASE_SUFFIXES.get(case, ()):
+            stem = text[: -len(suffix)] if text.lower().endswith(suffix) else ""
+            if len(stem) >= 3 and stem.lower() in _known_person_tokens:
+                return stem
+    return text
+
+
+def _join_tokens(tokens: list, words: list[str]) -> str:
+    out = []
+    for i, (token, word) in enumerate(zip(tokens, words)):
+        out.append(word)
+        if i < len(tokens) - 1:
+            out.append(token.whitespace_)
+    return " ".join("".join(out).split())
+
+
+def _normalize_ru_person(span) -> str:
+    tokens = _person_tokens(span)
+    anchor = span.root if any(t.i == span.root.i for t in tokens) else tokens[0]
+    case = (anchor.morph.get("Case") or [None])[0]
+    gender = (anchor.morph.get("Gender") or [None])[0]
+    return _join_tokens(tokens, [_nominative_person_token(token, case, gender) for token in tokens])
+
+
 def _normalize_ru_phrase(span, entity_type: str) -> str:
     root = span.root
     root_parse = _best_parse(root.text, entity_type)
     root_inflected = root_parse.inflect({"nomn"})
     root_word = root_inflected.word if root_inflected else root.text.lower()
+    # Аббревиатура: «США», «МИД», «ЕС» — pymorphy выдаёт лемму строчными, и она
+    # превращалась в «Сша», «Мид», «Ес». Слово целиком прописное — оставляем как есть.
+    if root.text.isupper() and len(root.text) > 1:
+        root_word = root.text
     root_gender = root_inflected.tag.gender if root_inflected and root_inflected.tag.gender else None
 
+    tokens = list(span)
     words = []
-    for token in span:
+    for token in tokens:
         if token.i == root.i:
             words.append(_titlecase(root_word))
             continue
@@ -72,34 +237,41 @@ def _normalize_ru_phrase(span, entity_type: str) -> str:
             words.append(_titlecase(word))
         else:
             words.append(token.text)
-    return " ".join(words)
+    return _join_tokens(tokens, words)
 
 
 def normalize_entity_name(span, lang: str, entity_type: str) -> str:
     """Раздел 3.3 CLAUDE.md: "Нацбанк"/"НБ РК"/"Национальный банк Казахстана" —
     одна запись, нужно приведение к именительному падежу.
 
-    Для person лемматизация не делается: на реальных данных pymorphy3 уверенно
-    (score=1.0) лемматизировал фамилию "Токаев" в "токай" — случайное совпадение
-    с несвязанным словарным словом, альтернативы "фамилия" в его словаре просто
-    нет. Падежные варианты фамилий по-прежнему схлопываются в resolve_entity()
-    нечётким сравнением алиасов (rapidfuzz).
+    Для person лемматизация словарём не годится: pymorphy3 уверенно (score=1.0)
+    лемматизировал фамилию "Токаев" в "токай" — случайное совпадение с несвязанным
+    словарным словом. Поэтому person приводится по-другому (_normalize_ru_person):
+    падеж и род берём у spaCy, форму — только из разборов pymorphy с граммемой
+    Surn/Name/Patr, а именительный падеж не трогаем. Раньше падежные формы
+    ("Трамп", "Трампа", "Трампом", "Трампу") оставались четырьмя разными сущностями.
     """
     text = " ".join(span.text.split())
-    if not text or lang != "ru" or entity_type == "person":
+    if not text or lang != "ru":
         return text
+    if entity_type == "person":
+        return _normalize_ru_person(span) or text
     return _normalize_ru_phrase(span, entity_type)
+
+
+def is_publisher_name(name: str) -> bool:
+    return _stop_key(name) in _PUBLISHERS
 
 
 def extract_mentions(nlp, text: str, lang: str) -> list[tuple[str, str]]:
     label_map = _LABEL_MAP[lang]
     mentions = []
-    for ent in nlp(text).ents:
+    for ent in nlp(strip_service_lines(text)).ents:
         entity_type = label_map.get(ent.label_)
         if not entity_type:
             continue
         canonical_name = normalize_entity_name(ent, lang, entity_type)
-        if canonical_name:
+        if canonical_name and not is_publisher_name(canonical_name):
             mentions.append((canonical_name, entity_type))
     return mentions
 
@@ -188,12 +360,24 @@ def _maybe_fix_person_canonical_name(conn, entity_id: str, candidate_name: str, 
         _shortest_person_name[entity_id] = len(candidate_name)
 
 
+_known_tokens_seeded = False
+
+
+def _ensure_known_person_tokens(conn) -> None:
+    global _known_tokens_seeded
+    if not _known_tokens_seeded:
+        seed_known_person_tokens(db.person_canonical_names(conn))
+        _known_tokens_seeded = True
+
+
 def process_article(conn, models: dict, article: dict) -> int:
     lang = article["lang"]
     nlp = models.get(lang)
     if nlp is None:
         db.mark_entities_extracted(conn, article["id"])
         return 0
+
+    _ensure_known_person_tokens(conn)
 
     text = "\n".join(part for part in (article["title"], article["lead"], article["body"]) if part)
     mentions = extract_mentions(nlp, text, lang)

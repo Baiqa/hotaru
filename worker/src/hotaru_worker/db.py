@@ -171,6 +171,14 @@ def load_alias_index(conn) -> list[dict]:
         return cur.fetchall()
 
 
+def person_canonical_names(conn) -> list[str]:
+    """Имена всех людей — чтобы entities.py знал, какие основы уже встречались
+    (отрезание падежного окончания у фамилий, которых нет в словаре pymorphy)."""
+    with conn.cursor() as cur:
+        cur.execute("select canonical_name from entities where type = 'person'")
+        return [row["canonical_name"] for row in cur.fetchall()]
+
+
 def upsert_article_entities(conn, article_id: str, counts: dict[str, int]) -> None:
     """Все сущности статьи одним батчем (вместо запроса на каждую)."""
     if not counts:
@@ -475,6 +483,16 @@ def entity_ids_by_article(conn, article_ids: list[str]) -> dict[str, set[str]]:
     return result
 
 
+def entity_document_frequencies(conn) -> tuple[int, dict[str, int]]:
+    """(число статей с извлечёнными сущностями, {entity_id: в скольких статьях}) —
+    для IDF-весов в scoring.py. Два запроса на весь прогон."""
+    with conn.cursor() as cur:
+        cur.execute("select count(*) as n from articles where entities_extracted_at is not null")
+        total = cur.fetchone()["n"]
+        cur.execute("select entity_id, count(*) as df from article_entities group by entity_id")
+        return total, {row["entity_id"]: row["df"] for row in cur.fetchall()}
+
+
 def find_candidate_articles(
     conn,
     article_id: str,
@@ -688,6 +706,20 @@ def articles_missing_event(conn, limit: int) -> list[dict]:
         return cur.fetchall()
 
 
+def event_span(conn, event_id: str) -> dict:
+    """Размер и временной размах события — для жёсткого лимита (scoring.MAX_EVENT_*)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select count(*) as article_count, min(a.published_at) as first_at, max(a.published_at) as last_at
+            from event_articles ea join articles a on a.id = ea.article_id
+            where ea.event_id = %s
+            """,
+            (event_id,),
+        )
+        return cur.fetchone()
+
+
 def event_id_for_article(conn, article_id: str) -> str | None:
     with conn.cursor() as cur:
         cur.execute("select event_id from event_articles where article_id = %s", (article_id,))
@@ -756,16 +788,26 @@ def get_gray_zone_verdict(conn, article_a_id: str, article_b_id: str) -> str | N
         return row["verdict"] if row else None
 
 
-def save_gray_zone_verdict(conn, article_a_id: str, article_b_id: str, verdict: str) -> None:
+def save_gray_zone_verdict(
+    conn, article_a_id: str, article_b_id: str, verdict: str, score: float | None = None, signals: dict | None = None
+) -> None:
+    """score и signals (четыре сигнала из scoring.score_pair) пишутся рядом с вердиктом —
+    для подбора порогов по реальным ответам LLM."""
     a, b = sorted((article_a_id, article_b_id))
+    signals = signals or {}
     with conn.cursor() as cur:
         cur.execute(
             """
-            insert into gray_zone_verdicts (article_a_id, article_b_id, verdict)
-            values (%s, %s, %s)
+            insert into gray_zone_verdicts
+              (article_a_id, article_b_id, verdict, score, entity_jaccard, tokens_jaccard, cosine_sim, time_decay)
+            values (%s, %s, %s, %s, %s, %s, %s, %s)
             on conflict (article_a_id, article_b_id) do nothing
             """,
-            (a, b, verdict),
+            (
+                a, b, verdict, score,
+                signals.get("entity_jaccard"), signals.get("tokens_jaccard"),
+                signals.get("cosine_sim"), signals.get("time_decay"),
+            ),
         )
 
 

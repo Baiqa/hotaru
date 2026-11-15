@@ -1,5 +1,7 @@
 import math
 import re
+import time
+from datetime import timedelta
 
 from . import db
 
@@ -16,6 +18,26 @@ TIME_DECAY_HALF_LIFE_HOURS = 24
 # размеченной выборке, когда появятся events (раздел 3.3 CLAUDE.md).
 DEFAULT_WINDOW_DAYS = 5
 DEFAULT_CANDIDATE_LIMIT = 50
+
+# Жёсткий лимит события (CLAUDE.md §3.3, «Дрейф»: «жёсткий лимит на длину окна события»):
+# событие — один факт реальности, а не цепочка. Без лимита статьи по одной приклеивались
+# к краю события, и оно разрасталось (проверено: «Белгород, 79 статей»). Дальше цепочку
+# связывают сюжеты (stories), а не событие. Применяется при присоединении статьи
+# (clustering.py) и при слиянии событий (event_merge.py).
+MAX_EVENT_SPAN = timedelta(hours=72)
+MAX_EVENT_ARTICLES = 40
+
+
+def within_event_limits(count_a: int, first_a, last_a, count_b: int, first_b, last_b) -> bool:
+    """Уложится ли объединение двух групп статей (статья = группа из одной, first == last)
+    в лимит события. first/last — время публикации; None — неизвестно, не считается."""
+    if count_a + count_b > MAX_EVENT_ARTICLES:
+        return False
+    firsts = [t for t in (first_a, first_b) if t is not None]
+    lasts = [t for t in (last_a, last_b) if t is not None]
+    if firsts and lasts and max(lasts) - min(firsts) > MAX_EVENT_SPAN:
+        return False
+    return True
 
 _NUMBER_RE = re.compile(r"\d[\d\s]*(?:[.,]\d+)?%?")
 
@@ -81,6 +103,49 @@ def entity_jaccard(entities_a: set[str], entities_b: set[str]) -> float:
     return _jaccard(entities_a, entities_b)
 
 
+# --- IDF-веса сущностей (фаза 4 плана P0) -----------------------------------------
+# Обычный Жаккар считает «Россию» (30% потока) и редкого фигуранта одинаково. Из-за этого
+# у крупных источников общая частая сущность не отсекала кандидатов, а верная пара
+# с редкой общей сущностью тонула (находка из tmp/plans/etap1-kalibrovka-po-keisam.md:
+# «верная пара на ранге #17–19, задавлена частыми сущностями США/МИД/Россия»).
+# Вес сущности = ln((N+1)/(df+1)) + 1: у встреченной везде — 1, у редкой — до ~ln(N)+1.
+# Единица в конце нужна, чтобы самая частая сущность не обнулялась совсем.
+
+IDF_TTL_SECONDS = 600
+
+
+class EntityWeights:
+    def __init__(self, total_articles: int, doc_freq: dict[str, int]):
+        self.total_articles = total_articles
+        self.doc_freq = doc_freq
+
+    def weight(self, entity_id: str) -> float:
+        return math.log((self.total_articles + 1) / (self.doc_freq.get(entity_id, 0) + 1)) + 1.0
+
+
+_weights_cache: tuple[float, EntityWeights] | None = None
+
+
+def get_entity_weights(conn) -> EntityWeights:
+    """Частоты — одним запросом на прогон; обновляются раз в IDF_TTL_SECONDS, чтобы
+    долгий прогон кластеризации не жил на устаревших числах."""
+    global _weights_cache
+    now = time.monotonic()
+    if _weights_cache is None or now - _weights_cache[0] > IDF_TTL_SECONDS:
+        total, doc_freq = db.entity_document_frequencies(conn)
+        _weights_cache = (now, EntityWeights(total, doc_freq))
+    return _weights_cache[1]
+
+
+def weighted_entity_jaccard(entities_a: set[str], entities_b: set[str], weights: EntityWeights) -> float:
+    union = entities_a | entities_b
+    if not union:
+        return 0.0
+    total = sum(weights.weight(e) for e in union)
+    common = sum(weights.weight(e) for e in entities_a & entities_b)
+    return common / total if total else 0.0
+
+
 def tokens_jaccard(tokens_a: set[str], tokens_b: set[str]) -> float:
     return _jaccard(tokens_a, tokens_b)
 
@@ -96,9 +161,21 @@ def _full_text(article: dict) -> str:
     return "\n".join(part for part in (article.get("title"), article.get("lead"), article.get("body")) if part)
 
 
-def score_pair(article_a: dict, entities_a: set[str], article_b: dict, entities_b: set[str], cosine_sim: float) -> dict:
+def score_pair(
+    article_a: dict,
+    entities_a: set[str],
+    article_b: dict,
+    entities_b: set[str],
+    cosine_sim: float,
+    weights: EntityWeights | None = None,
+) -> dict:
+    """weights=None — прежний неоценённый Жаккар (нужен для сравнения в eval/)."""
     signals = {
-        "entity_jaccard": entity_jaccard(entities_a, entities_b),
+        "entity_jaccard": (
+            weighted_entity_jaccard(entities_a, entities_b, weights)
+            if weights is not None
+            else entity_jaccard(entities_a, entities_b)
+        ),
         "tokens_jaccard": tokens_jaccard(extract_number_date_tokens(_full_text(article_a)), extract_number_date_tokens(_full_text(article_b))),
         "cosine_sim": cosine_sim,
         "time_decay": time_decay(article_a.get("published_at"), article_b.get("published_at")),
@@ -139,11 +216,17 @@ def score_candidates(
         return []
 
     candidate_entities = db.entity_ids_by_article(conn, [c["id"] for c in candidates])
+    weights = get_entity_weights(conn)
 
     scored = []
     for candidate in candidates:
         result = score_pair(
-            target, target_entities, candidate, candidate_entities[candidate["id"]], candidate["cosine_sim"]
+            target,
+            target_entities,
+            candidate,
+            candidate_entities[candidate["id"]],
+            candidate["cosine_sim"],
+            weights,
         )
         scored.append({"article": candidate, **result})
 

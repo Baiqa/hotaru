@@ -43,6 +43,22 @@ def _resolve_join_event(conn, candidate_article: dict) -> str:
     return event_id
 
 
+def _fits_event_limits(conn, article: dict, candidate_article: dict) -> bool:
+    """Жёсткий лимит события (scoring.MAX_EVENT_*): не присоединять статью к событию,
+    которое после этого стало бы длиннее 72 часов или больше 40 статей. Проверяется ДО
+    обращения к LLM, чтобы не тратить квоту на пару, которая всё равно не склеится.
+    Если у кандидата события ещё нет, оно будет создано из двух статей — тогда
+    проверяется размах между ними."""
+    event_id = db.event_id_for_article(conn, candidate_article["id"])
+    if event_id is None:
+        count, first_at, last_at = 1, candidate_article.get("published_at"), candidate_article.get("published_at")
+    else:
+        span = db.event_span(conn, event_id)
+        count, first_at, last_at = span["article_count"], span["first_at"], span["last_at"]
+    published_at = article.get("published_at")
+    return scoring.within_event_limits(count, first_at, last_at, 1, published_at, published_at)
+
+
 def cluster_article(conn, client: genai.Client, article: dict) -> tuple[str, bool]:
     """Раздел 3.3 CLAUDE.md, инкрементальный алгоритм на одну статью.
     Возвращает (event_id, created_new_event)."""
@@ -52,6 +68,9 @@ def cluster_article(conn, client: genai.Client, article: dict) -> tuple[str, boo
         candidate_article = candidate_result["article"]
         score = candidate_result["score"]
 
+        if score >= LOWER_THRESHOLD and not _fits_event_limits(conn, article, candidate_article):
+            continue
+
         if score > UPPER_THRESHOLD:
             should_join = True
         elif score < LOWER_THRESHOLD:
@@ -60,7 +79,9 @@ def cluster_article(conn, client: genai.Client, article: dict) -> tuple[str, boo
             verdict = db.get_gray_zone_verdict(conn, article["id"], candidate_article["id"])
             if verdict is None:
                 verdict = gray_zone.classify(client, article, candidate_article).value
-                db.save_gray_zone_verdict(conn, article["id"], candidate_article["id"], verdict)
+                db.save_gray_zone_verdict(
+                    conn, article["id"], candidate_article["id"], verdict, score, candidate_result["signals"]
+                )
             should_join = verdict == "same"
 
         if should_join:

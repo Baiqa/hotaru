@@ -34,7 +34,7 @@ def _pick_canonical(event_a: dict, event_b: dict) -> tuple[dict, dict]:
 
 def run_once(conn) -> dict:
     events = db.list_active_events(conn)
-    stats = {"checked": len(events), "merged_pairs": 0}
+    stats = {"checked": len(events), "merged_pairs": 0, "skipped_over_limit": 0}
     merged_ids: set[str] = set()
 
     for event in events:
@@ -56,6 +56,16 @@ def run_once(conn) -> dict:
                 event_majority_entities = db.event_majority_entities(conn, event["id"])
             candidate_majority_entities = db.event_majority_entities(conn, candidate["id"])
             if not (event_majority_entities & candidate_majority_entities):
+                continue
+            # Жёсткий лимит события (scoring.MAX_EVENT_*): слияние не должно собирать
+            # заново ту цепочку, которую присоединение статей уже отказалось строить.
+            span_a = db.event_span(conn, event["id"])
+            span_b = db.event_span(conn, candidate["id"])
+            if not scoring.within_event_limits(
+                span_a["article_count"], span_a["first_at"], span_a["last_at"],
+                span_b["article_count"], span_b["first_at"], span_b["last_at"],
+            ):
+                stats["skipped_over_limit"] += 1
                 continue
             event_full = {**event}
             candidate_full = {"id": candidate["id"], "article_count": candidate["article_count"], "started_at": candidate["started_at"]}
