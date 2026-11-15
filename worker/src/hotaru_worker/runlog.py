@@ -42,6 +42,13 @@ _MAX_ERROR_CHARS = 500
 # (локальный запуск без ключа --max-minutes ведёт себя как раньше).
 _deadline: float | None = None
 _budget_hit = False
+# Разобранные ключи командной строки текущего шага: общие (--max-minutes, --if-due-hours)
+# и шаговые (add_arguments у run). Шаг читает свои через runlog.args().
+_args: argparse.Namespace = argparse.Namespace()
+
+
+def args() -> argparse.Namespace:
+    return _args
 
 
 def out_of_time() -> bool:
@@ -110,11 +117,16 @@ def _raise_on_sigterm(signum, frame) -> None:
     sys.exit(128 + signum)
 
 
-def run(step: str, fn: Callable[[], dict | None], argv: list[str] | None = None) -> None:
+def run(
+    step: str,
+    fn: Callable[[], dict | None],
+    argv: list[str] | None = None,
+    add_arguments: Callable[[argparse.ArgumentParser], None] | None = None,
+) -> None:
     """Точка входа шага: разбирает ключи, ведёт журнал, выставляет бюджет времени.
     Исключение из `fn` записывается в журнал и пробрасывается дальше — код
     завершения процесса остаётся ненулевым, как и до появления журнала."""
-    global _deadline, _budget_hit
+    global _deadline, _budget_hit, _args
 
     logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
 
@@ -131,7 +143,10 @@ def run(step: str, fn: Callable[[], dict | None], argv: list[str] | None = None)
         default=None,
         help="выполнять, только если с последнего успешного запуска прошло больше N часов",
     )
+    if add_arguments is not None:
+        add_arguments(parser)
     args = parser.parse_args(argv)
+    _args = args
 
     cfg = config.load()
 

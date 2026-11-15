@@ -15,11 +15,27 @@ MAX_CONSECUTIVE_FAILURES = 5
 # См. embeddings.py: без явного таймаута зависший запрос к Gemini не попадает ни
 # в один except и висит часами с нулевой загрузкой CPU (случай 2026-11-03).
 _HTTP_TIMEOUT_MS = 30_000
+# Пакетная классификация серой зоны (фаза 5.4 плана P0) ВЫКЛЮЧЕНА по умолчанию: проверка
+# качества (eval/gray_batch_check.py, 201 пара поровну same/related/different) 2026-11-15
+# дала согласие с кешем 78% при 0 замен different -> same, но почти весь прогон ответила
+# слабая третья модель цепочки (дневная квота основной и Groq была исчерпана), поэтому
+# результат не показателен. Включить (12), когда повтор на основной модели даст >= 90%.
+DEFAULT_GRAY_BATCH_SIZE = 1
+
+
+def _add_arguments(parser) -> None:
+    parser.add_argument(
+        "--gray-batch-size",
+        type=int,
+        default=DEFAULT_GRAY_BATCH_SIZE,
+        help="пар серой зоны в одном запросе к LLM; 1 — без пакетов (по одной паре, как раньше)",
+    )
 
 
 def run_once() -> dict:
     cfg = config.load()
     client = genai.Client(http_options=types.HttpOptions(timeout=_HTTP_TIMEOUT_MS))
+    gray_batch_size = getattr(runlog.args(), "gray_batch_size", DEFAULT_GRAY_BATCH_SIZE)
 
     stats = {"processed": 0, "new_events": 0, "joined": 0, "skipped_llm_unavailable": 0}
 
@@ -37,6 +53,17 @@ def run_once() -> dict:
                 made_progress = False
                 quota_exhausted = False
                 time_up = False
+                prefetched: dict = {}
+                if gray_batch_size > 1:
+                    try:
+                        prefetched = clustering.prefetch_gray_zone(conn, client, batch, gray_batch_size)
+                    except gray_zone.DailyQuotaExceeded as exc:
+                        logger.warning("дневная квота LLM исчерпана (%s), завершаю прогон", exc)
+                        stats["skipped_llm_unavailable"] += 1
+                        break
+                    except (genai_errors.APIError, httpx.TransportError, httpx.HTTPStatusError) as exc:
+                        # Пакет не удался — не страшно: ниже каждая пара пойдёт одиночным запросом.
+                        logger.warning("пакетный запрос серой зоны не удался (%s), иду по одной паре", exc)
                 for article in batch:
                     if runlog.out_of_time():
                         time_up = True
@@ -51,7 +78,7 @@ def run_once() -> dict:
                         made_progress = True
                         continue
                     try:
-                        _, created = clustering.cluster_article(conn, client, article)
+                        _, created = clustering.cluster_article(conn, client, article, prefetched.get(article["id"]))
                     except gray_zone.DailyQuotaExceeded as exc:
                         # Дневная квота кончилась у всех провайдеров: повторы
                         # бессмысленны (замер 2026-11-09: 70 минут впустую на
@@ -89,12 +116,13 @@ def run_once() -> dict:
                 raise
             logger.warning("соединение с БД прервалось, переподключаюсь и продолжаю с необработанных статей")
 
+    stats.update(gray_zone.usage())
     logger.info("кластеризация событий завершена: %s", stats)
     return stats
 
 
 def main() -> None:
-    runlog.run("cluster-events", run_once)
+    runlog.run("cluster-events", run_once, add_arguments=_add_arguments)
 
 
 if __name__ == "__main__":

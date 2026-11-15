@@ -142,9 +142,11 @@ def _call_model_once(client: genai.Client, model: str, prompt: str) -> _Synthesi
     raise AssertionError("unreachable")
 
 
-def _call_model(client: genai.Client, prompt: str) -> _SynthesisResponse:
+def _call_model(client: genai.Client, prompt: str) -> tuple[_SynthesisResponse, str]:
     """Тот же урок, что в claim_grouping.py: короткий retry-бюджет на основной
-    модели, затем фолбэк на вторую — сага 503 2026-10-26."""
+    модели, затем фолбэк на вторую — сага 503 2026-10-26. Вместе с ответом
+    возвращает имя модели, которая реально ответила (пишется в renders.model:
+    раньше там всегда стояла константа MODEL, даже когда отвечал Groq)."""
     groq_api_key = os.environ.get("GROQ_API_KEY")
 
     # Живой тест 2026-11-09: без этой проверки прогон с мёртвой Gemini-квотой
@@ -152,21 +154,21 @@ def _call_model(client: genai.Client, prompt: str) -> _SynthesisResponse:
     # упасть в Groq. Если уже знаем, что Gemini мёртв в этом прогоне, сразу
     # идём в Groq.
     if groq_api_key and quota.gemini_dead_this_run():
-        return _call_model_groq(groq_api_key, prompt)
+        return _call_model_groq(groq_api_key, prompt), groq_client.MODEL
 
     try:
-        return _call_model_once(client, MODEL, prompt)
+        return _call_model_once(client, MODEL, prompt), MODEL
     except (errors.APIError, httpx.TransportError):
         logger.warning("основная модель %s не отвечает, пробую фолбэк %s", MODEL, FALLBACK_MODEL)
         try:
-            return _call_model_once(client, FALLBACK_MODEL, prompt)
+            return _call_model_once(client, FALLBACK_MODEL, prompt), FALLBACK_MODEL
         except (errors.APIError, httpx.TransportError) as exc2:
             if isinstance(exc2, errors.APIError) and exc2.code == 429:
                 quota.mark_gemini_dead()
             if not groq_api_key:
                 raise
             logger.warning("обе модели Gemini недоступны, пробую Groq (%s)", groq_client.MODEL)
-            return _call_model_groq(groq_api_key, prompt)
+            return _call_model_groq(groq_api_key, prompt), groq_client.MODEL
 
 
 def _word_shingles(text: str, n: int) -> set[tuple[str, ...]]:
@@ -196,9 +198,11 @@ def _is_year_like(value: float) -> bool:
     return value == int(value) and 1900 <= value <= 2100
 
 
-def generate_render(client: genai.Client, event_id: str, facts: list[dict], format: str) -> tuple[str, list[list[str]]] | None:
+def generate_render(
+    client: genai.Client, event_id: str, facts: list[dict], format: str
+) -> tuple[str, list[list[str]], str] | None:
     """Раздел 3.4 CLAUDE.md: модель видит ТОЛЬКО facts (не исходные статьи).
-    Возвращает (body, sentence_claims) либо None, если даже после
+    Возвращает (body, sentence_claims, model) либо None, если даже после
     MAX_GENERATION_RETRIES не удалось получить проверяемую генерацию — вызывающий
     код должен пропустить событие в этом прогоне, не блокируя остальные.
     """
@@ -214,7 +218,7 @@ def generate_render(client: genai.Client, event_id: str, facts: list[dict], form
     prompt = prompt_template.format(facts=_format_facts(facts))
 
     for attempt in range(MAX_GENERATION_RETRIES):
-        response = _call_model(client, prompt)
+        response, model_used = _call_model(client, prompt)
 
         kept_sentences: list[str] = []
         kept_claim_ids: list[list[str]] = []
@@ -246,7 +250,7 @@ def generate_render(client: genai.Client, event_id: str, facts: list[dict], form
             )
             continue
 
-        return "\n".join(kept_sentences), kept_claim_ids
+        return "\n".join(kept_sentences), kept_claim_ids, model_used
 
     logger.warning("событие %s: генерация не прошла пост-проверку по числам после %s попыток, пропускаю", event_id, MAX_GENERATION_RETRIES)
     return None

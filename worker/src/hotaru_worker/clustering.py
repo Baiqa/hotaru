@@ -2,7 +2,7 @@ import logging
 
 from google import genai
 
-from . import db, gray_zone, scoring
+from . import db, gray_zone, runlog, scoring
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +59,59 @@ def _fits_event_limits(conn, article: dict, candidate_article: dict) -> bool:
     return scoring.within_event_limits(count, first_at, last_at, 1, published_at, published_at)
 
 
-def cluster_article(conn, client: genai.Client, article: dict) -> tuple[str, bool]:
+def _is_gray(score: float) -> bool:
+    return LOWER_THRESHOLD <= score <= UPPER_THRESHOLD
+
+
+def prefetch_gray_zone(conn, client: genai.Client, articles: list[dict], batch_size: int) -> dict:
+    """Фаза 5.4 плана P0. Скоры без LLM для всей пачки статей, затем вердикты серой зоны —
+    пакетами по batch_size пар одним запросом (gray_zone.classify_batch) в кеш
+    gray_zone_verdicts. Дальше cluster_article работает как прежде, последовательно, и
+    находит вердикты в кеше: логика решений не меняется, меняется число запросов.
+    Возвращает {article_id: scored} — готовые скоры, чтобы не считать их второй раз.
+    Пары берутся в том же порядке и с теми же отсечками (топ CANDIDATE_TRIES, серая зона,
+    лимит события), что и в cluster_article. Исключения LLM (квота) пробрасываются."""
+    scored_by_article: dict = {}
+    pending: list[tuple[dict, dict]] = []
+    seen: set[tuple] = set()
+    for article in articles:
+        if db.event_id_for_article(conn, article["id"]) is not None:
+            continue
+        scored = scoring.score_candidates(conn, article["id"])
+        scored_by_article[article["id"]] = scored
+        for result in scored[:CANDIDATE_TRIES]:
+            candidate = result["article"]
+            if not _is_gray(result["score"]):
+                continue
+            key = tuple(sorted((str(article["id"]), str(candidate["id"]))))
+            if key in seen or db.get_gray_zone_verdict(conn, article["id"], candidate["id"]) is not None:
+                continue
+            if not _fits_event_limits(conn, article, candidate):
+                continue
+            seen.add(key)
+            pending.append((article, result))
+
+    for start in range(0, len(pending), batch_size):
+        if runlog.out_of_time():
+            break
+        chunk = pending[start : start + batch_size]
+        verdicts = gray_zone.classify_batch(client, [(a, r["article"]) for a, r in chunk])
+        for (article, result), verdict in zip(chunk, verdicts):
+            if verdict is not None:
+                db.save_gray_zone_verdict(
+                    conn, article["id"], result["article"]["id"], verdict.value, result["score"], result["signals"]
+                )
+    return scored_by_article
+
+
+def cluster_article(
+    conn, client: genai.Client, article: dict, scored: list[dict] | None = None
+) -> tuple[str, bool]:
     """Раздел 3.3 CLAUDE.md, инкрементальный алгоритм на одну статью.
-    Возвращает (event_id, created_new_event)."""
-    scored = scoring.score_candidates(conn, article["id"])
+    Возвращает (event_id, created_new_event). scored — уже посчитанные скоры
+    (prefetch_gray_zone), иначе считаются здесь."""
+    if scored is None:
+        scored = scoring.score_candidates(conn, article["id"])
 
     for candidate_result in scored[:CANDIDATE_TRIES]:
         candidate_article = candidate_result["article"]

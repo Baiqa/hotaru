@@ -8,6 +8,8 @@ from psycopg import errors as pg_errors
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from . import facts
+
 logger = logging.getLogger(__name__)
 
 
@@ -230,19 +232,60 @@ def mark_entities_extracted(conn, article_id: str) -> None:
         )
 
 
-def articles_missing_claims(conn, limit: int) -> list[dict]:
+# Бюджет LLM (фаза 5 плана P0): на бесплатной квоте текст получают не все события, поэтому
+# очереди работают только со свежими — старше этого срока событие в очередь не попадает.
+QUEUE_FRESH_DAYS = 3
+
+# Статья относится к «событию с 2+ изданиями» (приоритетная очередь фактов), если такое событие
+# свежее. Один и тот же кусок SQL в очередях извлечения, эмбеддингов и группировки фактов.
+_IN_FRESH_MULTI_EVENT = """
+    exists (
+        select 1 from event_articles ea_q join events e_q on e_q.id = ea_q.event_id
+        where ea_q.article_id = {article}.id
+          and e_q.status = 'active'
+          and e_q.source_count >= 2
+          and e_q.last_article_at > now() - make_interval(days => %(fresh)s)
+    )
+"""
+
+MAX_CLAIMS_ATTEMPTS = 3
+
+
+def articles_missing_claims(conn, limit: int, scope: str = "all", exclude: list | None = None) -> list[dict]:
+    """Очередь извлечения фактов (фаза 5 плана P0). Только свежее: события с 2+ изданиями,
+    у которых последняя статья моложе QUEUE_FRESH_DAYS, и статьи моложе этого срока.
+    scope: 'multi' — статьи таких событий; 'rest' — остальные свежие статьи (одиночные
+    события и статьи, ещё не попавшие в событие); 'all' — и те и другие. Свежие первыми
+    (раньше шли от старых к новым). Статья, на которой LLM MAX_CLAIMS_ATTEMPTS раз ответила
+    постоянной ошибкой, из очереди выпадает — иначе «отравленная» статья блокировала бы
+    очередь. exclude — статьи, уже не удавшиеся в этом прогоне."""
+    multi = _IN_FRESH_MULTI_EVENT.format(article="a")
+    fresh_article = "a.published_at > now() - make_interval(days => %(fresh)s)"
+    where_scope = {
+        "multi": multi,
+        "rest": f"({fresh_article} and not {multi})",
+        "all": f"({multi} or {fresh_article})",
+    }[scope]
     with conn.cursor() as cur:
         cur.execute(
-            """
-            select id, title, lead, body, published_at
-            from articles
-            where claims_extracted_at is null and fetch_status = 'ok' and body is not null
-            order by published_at nulls last
-            limit %s
+            f"""
+            select a.id, a.title, a.lead, a.body, a.published_at
+            from articles a
+            where a.claims_extracted_at is null and a.fetch_status = 'ok' and a.body is not null
+              and a.claims_attempts < %(attempts)s
+              and a.id <> all(%(exclude)s::uuid[])
+              and {where_scope}
+            order by a.published_at desc nulls last
+            limit %(limit)s
             """,
-            (limit,),
+            {"fresh": QUEUE_FRESH_DAYS, "attempts": MAX_CLAIMS_ATTEMPTS, "exclude": exclude or [], "limit": limit},
         )
         return cur.fetchall()
+
+
+def bump_claims_attempts(conn, article_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("update articles set claims_attempts = claims_attempts + 1 where id = %s", (article_id,))
 
 
 def insert_claims(conn, article_id: str, claims: list[dict]) -> None:
@@ -278,10 +321,23 @@ def mark_claims_extracted(conn, article_id: str) -> None:
 
 
 def claims_missing_embedding(conn, limit: int) -> list[dict]:
+    """Эмбеддинги нужны только для группировки фактов, а группировать есть что лишь в событиях
+    с 2+ изданиями (фаза 5 плана P0): внутри одиночного события факты одной статьи не
+    дублируют друг друга. На такие события приходилось 2872 факта из 9523. Свежие события первыми."""
     with conn.cursor() as cur:
         cur.execute(
-            "select id, text from claims where embedding is null order by created_at limit %s",
-            (limit,),
+            """
+            select c.id, c.text
+            from claims c
+            join event_articles ea on ea.article_id = c.article_id
+            join events e on e.id = ea.event_id
+            where c.embedding is null
+              and e.status = 'active' and e.source_count >= 2
+              and e.last_article_at > now() - make_interval(days => %(fresh)s)
+            order by e.last_article_at desc, c.created_at
+            limit %(limit)s
+            """,
+            {"fresh": QUEUE_FRESH_DAYS, "limit": limit},
         )
         return cur.fetchall()
 
@@ -294,19 +350,24 @@ def update_claim_embedding(conn, claim_id: str, vector: list[float]) -> None:
 def claims_missing_group(conn, limit: int) -> list[dict]:
     """Claims без группы, но только у статей, уже попавших в событие (inner join —
     claim статьи без события сам пока не дошёл до кластеризации, появится в следующем
-    прогоне после articles_missing_event, а не застрянет здесь молча)."""
+    прогоне после articles_missing_event, а не застрянет здесь молча). Только события с
+    2+ изданиями и свежие (см. claims_missing_embedding), свежие первыми; внутри события —
+    по времени создания, как раньше."""
     with conn.cursor() as cur:
         cur.execute(
             """
             select c.id, c.article_id, c.text, c.evidence, c.embedding, ea.event_id
             from claims c
             join event_articles ea on ea.article_id = c.article_id
+            join events e on e.id = ea.event_id
             left join claim_group_members cgm on cgm.claim_id = c.id
             where cgm.claim_id is null and c.embedding is not null
-            order by c.created_at
-            limit %s
+              and e.status = 'active' and e.source_count >= 2
+              and e.last_article_at > now() - make_interval(days => %(fresh)s)
+            order by e.last_article_at desc, e.id, c.created_at
+            limit %(limit)s
             """,
-            (limit,),
+            {"fresh": QUEUE_FRESH_DAYS, "limit": limit},
         )
         return cur.fetchall()
 
@@ -874,45 +935,76 @@ def save_monitoring_check(conn, check_name: str, status: str, details: dict) -> 
         )
 
 
-def events_missing_render(conn, limit: int) -> list[dict]:
-    """События без summary_30s render, у которых есть хотя бы один claim — нет
-    смысла синтезировать текст для события без фактов. Не ждёт завершения
-    embedding/группировки claims (раздел 3.4: синтез работает по фактам события,
-    группировка только уточняет bucket — см. event_facts_for_synthesis)."""
+# После стольких неудач подряд событие откладывается на сутки (render_failed_at).
+MAX_RENDER_ATTEMPTS = 3
+
+
+def events_missing_render(conn, limit: int, exclude: list | None = None) -> list[dict]:
+    """Очередь синтеза сводки summary_30s. Только свежие активные события (последняя
+    статья моложе QUEUE_FRESH_DAYS), у которых есть факты. Сводку получает событие, у
+    которого её нет, либо у которого изданий стало больше, чем было при написании.
+    События с неудачами: после MAX_RENDER_ATTEMPTS подряд — пауза на сутки.
+    Порядок: сначала события с 2+ изданиями (на них держится смысл продукта), затем самые
+    свежие. Раньше очередь шла от старых событий к новым, и в её голове лежали события
+    2022–2023 годов. exclude — события, которые в этом прогоне уже не удались: без
+    этого сбой, не засчитанный как неудача (сеть), возвращал бы их в голову очереди."""
     with conn.cursor() as cur:
         cur.execute(
             """
-            select e.id, e.title
+            select e.id, e.title, e.source_count
             from events e
+            left join renders r on r.event_id = e.id and r.format = 'summary_30s' and r.lang = 'ru'
             where e.status = 'active'
+              and e.last_article_at > now() - make_interval(days => %(fresh)s)
               and exists (
                 select 1 from event_articles ea join claims c on c.article_id = ea.article_id
                 where ea.event_id = e.id
               )
-              and (
-                select count(*) from renders r where r.event_id = e.id
-              ) < 2
-            order by e.started_at
-            limit %s
+              and (r.id is null or e.source_count > coalesce(e.rendered_source_count, 0))
+              and (e.render_attempts < %(attempts)s or e.render_failed_at < now() - interval '1 day')
+              and e.id <> all(%(exclude)s::uuid[])
+            order by (e.source_count >= 2) desc, e.last_article_at desc
+            limit %(limit)s
             """,
-            (limit,),
+            {"fresh": QUEUE_FRESH_DAYS, "attempts": MAX_RENDER_ATTEMPTS, "limit": limit, "exclude": exclude or []},
         )
         return cur.fetchall()
 
 
+def record_render_result(conn, event_id: str, ok: bool) -> None:
+    """Успех обнуляет счётчик неудач и запоминает, при скольких изданиях написана сводка.
+    Неудачей считается только провал самой генерации (пост-проверка отклонила текст,
+    модель вернула мусор) — не квота и не сетевой сбой: они не вина события."""
+    with conn.cursor() as cur:
+        if ok:
+            cur.execute(
+                """
+                update events
+                set render_attempts = 0, render_failed_at = null, rendered_source_count = source_count
+                where id = %s
+                """,
+                (event_id,),
+            )
+        else:
+            cur.execute(
+                "update events set render_attempts = render_attempts + 1, render_failed_at = now() where id = %s",
+                (event_id,),
+            )
+
+
 def event_facts_for_synthesis(conn, event_id: str) -> list[dict]:
     """Факты события для синтеза (раздел 3.4 CLAUDE.md) — модель-синтезатор видит
-    ТОЛЬКО это, не исходные статьи. bucket по умолчанию 'unique', если claim ещё не
+    ТОЛЬКО это, не исходные статьи. Одна строка — одна группа фактов (facts.collapse_facts),
+    не больше facts.MAX_FACT_LINES. bucket по умолчанию 'unique', если claim ещё не
     дошёл до группировки (claims_missing_group работает в фоне отдельно) — так
     синтез не блокируется незавершённой группировкой, просто консервативно считает
     факт пока неподтверждённым."""
     with conn.cursor() as cur:
         cur.execute(
             """
-            select c.id as claim_id, c.text, c.evidence, c.type,
+            select c.id as claim_id, c.text, c.evidence, c.type, c.created_at,
                    s.name as source_name, a.url as source_url,
-                   coalesce(cg.bucket, 'unique') as bucket,
-                   coalesce(cg.source_count, 1) as source_count
+                   cg.id as group_id, cg.bucket, cg.source_count, cgm.relation
             from claims c
             join articles a on a.id = c.article_id
             join sources s on s.id = a.source_id
@@ -920,13 +1012,13 @@ def event_facts_for_synthesis(conn, event_id: str) -> list[dict]:
             left join claim_group_members cgm on cgm.claim_id = c.id
             left join claim_groups cg on cg.id = cgm.claim_group_id
             where ea.event_id = %s
-            order by c.created_at
             """,
             (event_id,),
         )
-        claims = cur.fetchall()
-        if not claims:
+        rows = cur.fetchall()
+        if not rows:
             return []
+        claims = facts.collapse_facts(rows)
 
         claim_ids = [row["claim_id"] for row in claims]
         cur.execute(

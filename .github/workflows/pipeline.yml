@@ -87,10 +87,12 @@ jobs:
         run: uv run --frozen hotaru-assign-stories --max-minutes 5
 
       # --- 2. Факты и тексты (делят дневную квоту LLM) ---
-      - name: Extract claims
+      # Бюджет LLM (фаза 5 плана P0): сначала статьи свежих событий с 2+ изданиями, на
+      # них держится смысл продукта; остальным достаётся остаток (шаг ниже, с потолком).
+      - name: Extract claims (события с 2+ изданиями)
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         timeout-minutes: 18
-        run: uv run --frozen hotaru-extract-claims --max-minutes 12
+        run: uv run --frozen hotaru-extract-claims --scope multi --max-minutes 12
       - name: Embed claims
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         timeout-minutes: 10
@@ -103,6 +105,10 @@ jobs:
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         timeout-minutes: 18
         run: uv run --frozen hotaru-synthesize --max-minutes 12
+      - name: Extract claims (остальные свежие статьи)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 10
+        run: uv run --frozen hotaru-extract-claims --scope rest --max-items 20 --max-minutes 6
 
       # --- 3. Редкие шаги: выполняются, только если пришло время ---
       - name: Split events (раз в сутки)
