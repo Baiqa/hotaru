@@ -6,7 +6,7 @@ const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 if (!url || !anonKey) {
   throw new Error(
     "NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY не заданы. " +
-      "Скопируйте web/.env.local.example в web/.env.local."
+      "Скопируйте web/.env.example в web/.env.local."
   );
 }
 
