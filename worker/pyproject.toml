@@ -39,6 +39,7 @@ hotaru-group-claims = "hotaru_worker.group_claims:main"
 hotaru-synthesize = "hotaru_worker.synthesize:main"
 hotaru-fetch-metrics = "hotaru_worker.metrics:main"
 hotaru-monitor = "hotaru_worker.monitor:main"
+hotaru-rebuild = "hotaru_worker.rebuild:main"
 
 [build-system]
 requires = ["uv_build>=0.11.26,<0.12.0"]
