@@ -72,7 +72,7 @@ export async function getMetricChartData(rule: AllowlistRule): Promise<MetricCha
     .map((row) => {
       const country = rule.countries.find((c) => row.key.endsWith(`:${c.iso3}`));
       if (!country) return null;
-      const points = [...(row.metric_points ?? [])].sort((a, b) => a.period.localeCompare(b.period));
+      const points = (row.metric_points ?? []).toSorted((a, b) => a.period.localeCompare(b.period));
       if (points.length === 0) return null;
       return { countryName: country.nameRu, points };
     })
