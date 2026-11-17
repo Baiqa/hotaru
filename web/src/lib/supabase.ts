@@ -11,6 +11,7 @@ if (!url || !anonKey) {
 }
 
 // Анонимный read-only ключ, ограниченный RLS-политиками (публичное чтение
-// sources/articles) — см. supabase/migrations. Для записи используется
-// service_role только из worker/, сюда он попадать не должен.
+// sources/articles) — см. supabase/migrations и docs/rbac.md. Пишет в БД только воркер
+// по прямой строке подключения DATABASE_URL (не через API); service_role не используется
+// нигде, а сюда не должен попадать ни он, ни строка воркера.
 export const supabase = createClient(url, anonKey);
